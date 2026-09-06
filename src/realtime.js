@@ -1,6 +1,6 @@
-import fs from 'node:fs'
 let dbgAudio = 0
 import WebSocket from 'ws'
+import { dbg } from './debug.js'
 import { EventEmitter } from 'node:events'
 import { MODEL, VOICE, SAMPLE_RATE } from './config.js'
 import { REALTIME_TOOLS, INSTRUCTIONS } from './tools.js'
@@ -29,6 +29,7 @@ export class RealtimeSession extends EventEmitter {
     this.responseActive = false
     this.pendingResponse = false
     this.handledCallIds = new Set()
+    this.reconnectAttempts = 0
     this.assistantBuffer = ''
   }
 
@@ -40,10 +41,17 @@ export class RealtimeSession extends EventEmitter {
     this.ws = ws
 
     ws.on('open', () => {
+      this.reconnectAttempts = 0
       this._configure()
       // Proactive rotation: re-open a fresh session before the 60-minute cap.
       clearTimeout(this.rotationTimer)
       this.rotationTimer = setTimeout(() => {
+        // Idle-aware: rotating mid-response (or mid tool call) would swallow
+        // in-flight results — defer a few seconds until the session is quiet.
+        if (this.responseActive || this.pendingResponse) {
+          this.rotationTimer.refresh()
+          return
+        }
         this.reconnect()
       }, Number(process.env.HERDR_VOICE_ROTATE_MS ?? 55 * 60 * 1000))
       this.rotationTimer.unref?.()
@@ -60,6 +68,13 @@ export class RealtimeSession extends EventEmitter {
     ws.on('error', (err) => this.emit('status', { state: 'error', message: err.message }))
     const sock = ws
     ws.on('close', (code) => {
+      if (code >= 4000 && code < 5000) {
+        this.ready = false
+        clearTimeout(this.rotationTimer)
+        clearTimeout(this.reconnectTimer)
+        this.emit('status', { state: 'closed-final', code })
+        return
+      }
       // Superseded socket (reconnect already opened a replacement): its close
       // event must NOT schedule anything. Without this guard every rotation
       // and every reconnect scheduled a SECOND reconnect from the old
@@ -71,6 +86,7 @@ export class RealtimeSession extends EventEmitter {
       this.emit('status', { state: 'closed', code })
       // Auto-reconnect unless the user closed the session. OpenAI hard-caps
       // Realtime sessions at 60 minutes — without this, the agent dies hourly.
+      // A successful (re)connect resets the backoff ladder.
       if (!this.intentionalClose) this._scheduleReconnect()
     })
     return this
@@ -78,16 +94,23 @@ export class RealtimeSession extends EventEmitter {
 
   _scheduleReconnect() {
     if (this.reconnectTimer) return
+    // Exponential backoff with jitter: 0.5s, 1s, 2s ... capped at 8s. Auth
+    // and policy failures (4xxx close codes) are fatal — retrying them is
+    // the 'constantly reconnecting' experience with no chance of success.
+    const delay = Math.min(8000, 500 * 2 ** this.reconnectAttempts) + Math.random() * 250
+    this.reconnectAttempts++
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.reconnect()
-    }, 2000)
+    }, delay)
   }
 
   /** Fresh session (new 60-minute window). Used for auto-reconnect and
    *  proactive rotation before the cap. Conversation context resets; herdr
    *  state is re-read live by the tools, so nothing else is lost. */
   reconnect() {
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
     const old = this.ws
     this.ws = null // detach first: the old socket's close event must not reschedule
     try { old?.close() } catch { /* already gone */ }
@@ -104,7 +127,7 @@ export class RealtimeSession extends EventEmitter {
   }
 
   _send(obj) {
-    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} SEND ${obj.type}\n`) } catch {}
+    dbg(`${new Date().toISOString()} SEND ${obj.type}\n`)
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj))
   }
 
@@ -188,12 +211,13 @@ export class RealtimeSession extends EventEmitter {
   _handle(ev) {
     try {
       let extra = ''
+      if (ev.type === 'response.done') extra = ` status=${ev.response?.status} out_audio_tokens=${ev.response?.usage?.output_token_details?.audio_tokens ?? '?'}`
       if (ev.error) extra = ' ' + JSON.stringify(ev.error).slice(0, 200)
       if (ev.type === 'response.done') extra = ` status=${ev.response?.status} out_audio_tokens=${ev.response?.usage?.output_token_details?.audio_tokens ?? '?'}`
       if (ev.type === 'response.output_audio.delta') dbgAudio++
       if (ev.type === 'response.created') dbgAudio = 0
       if (ev.type === 'response.output_audio.done' || ev.type === 'response.done') extra += ` audioDeltas=${dbgAudio}`
-      fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} RECV ${ev.type}${extra}\n`)
+      dbg(`${new Date().toISOString()} RECV ${ev.type}${extra}\n`)
     } catch {}
     switch (ev.type) {
       case 'session.updated':
@@ -300,6 +324,7 @@ export class RealtimeSession extends EventEmitter {
           if (item.type === 'function_call') this._dispatchCall(item.name, item.call_id, item.arguments)
         }
         this._releaseResponse()
+        if (ev.response?.status === 'completed') this.emit('response_done')
         break
       }
 
@@ -309,6 +334,7 @@ export class RealtimeSession extends EventEmitter {
           message: ev.error?.message ?? 'unknown realtime error',
         })
         this._releaseResponse()
+        if (ev.response?.status === 'completed') this.emit('response_done')
         break
     }
   }

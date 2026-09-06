@@ -4,6 +4,8 @@ import { RealtimeSession } from './realtime.js'
 import { MicCapture, AudioPlayer } from './audio.js'
 import { createExecutor, readState } from './tools.js'
 import { TranscriptStore, copyToClipboard } from './transcript.js'
+import { dbg } from './debug.js'
+import { SAMPLE_RATE } from './config.js'
 
 // A voice session dying silently is the worst failure mode (the pane just
 // vanishes with no trace). Surface anything that would otherwise be lost.
@@ -21,7 +23,7 @@ process.on('uncaughtException', (e) => console.error('[voice] uncaught exception
  * setHerdrState. Returns handles the host wires to its input events.
  */
 export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = true, micDevice }) {
-  const transcript = new TranscriptStore(); console.error('DBG1 transcript')
+  const transcript = new TranscriptStore()
   const player = new AudioPlayer().start()
   player.on('error', (e) => ui.addSystem(`audio out failed: ${e.message}`))
   let soundOn = true
@@ -123,6 +125,8 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     suppressAudio = false
     bargeWindow = false
     bargeRun = 0
+    playbackStart = 0
+    queuedAudioSec = 0
   })
 
   // After any barge-in, the cancelled response's remaining audio keeps
@@ -132,10 +136,20 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   // Suppression drops those stale deltas and lifts only when the NEXT
   // response is created — i.e. when the answer to the interruption starts.
   let suppressAudio = false
+  // Playback-position tracking: the model streams audio FASTER than realtime,
+  // so a 6s answer can finish ARRIVING in ~1s while the speaker is still
+  // playing it. The echo gate must follow the playback position (start time +
+  // queued seconds), not the last byte's arrival — otherwise the mic reopens
+  // mid-sentence and the server hears the AI talking to itself.
+  let playbackStart = 0
+  let queuedAudioSec = 0
   const bargeIn = () => {
     suppressAudio = true
     player.flush()
     session.cancelResponse()
+    playbackStart = 0
+    queuedAudioSec = 0
+    agentAudioTail = Date.now() + 500
     ui.setSpeaking(false)
   }
   const stopAudio = () => {
@@ -143,10 +157,24 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     ui.notify('audio stopped')
   }
   session.on('audio', (b64) => {
-    agentAudioTail = Date.now() + 500
+    if (soundOn) {
+      const secs = b64.length * 0.75 / 2 / SAMPLE_RATE // base64 -> bytes -> int16 samples -> seconds
+      if (!playbackStart) playbackStart = Date.now()
+      queuedAudioSec += secs
+      agentAudioTail = playbackStart + queuedAudioSec * 1000 + 500
+      dbg(`${new Date().toISOString()} PLAY +${secs.toFixed(2)}s\n`)
+    } else {
+      playbackStart = 0
+      queuedAudioSec = 0
+      agentAudioTail = 0 // muted speakers: no echo to protect against
+    }
     if (suppressAudio) return
-    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} PLAY +${b64.length}b64chars\n`) } catch {}
     if (soundOn) player.play(b64)
+  })
+  session.on('response_done', () => {
+    // The response finished normally: lift stale-audio suppression. The gate
+    // tail stays until the buffered playback actually finishes.
+    suppressAudio = false
   })
   session.on('interrupt', bargeIn)
   session.on('barge', bargeIn)
@@ -169,7 +197,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     }
   })
 
-  console.error('DBG2 before connect'); session.connect(); console.error('DBG3 after connect')
+  session.connect()
 
   // ---- mic ----
   let mic = null
@@ -260,12 +288,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
           const thr = Math.max(bargeLevel, echoPeak * 1.4)
           bargeRun = l >= thr ? bargeRun + 1 : 0
           if (l >= thr || bargeRun > 0) {
-            try {
-              fs.appendFileSync(
-                '/tmp/herdr-voice-ws.log',
-                `${new Date().toISOString()} BARGE lvl=${l.toFixed(4)} thr=${thr.toFixed(4)} run=${bargeRun}\n`
-              )
-            } catch {}
+            dbg(`${new Date().toISOString()} BARGE lvl=${l.toFixed(4)} thr=${thr.toFixed(4)} run=${bargeRun}\n`)
           }
           if (!bargeWindow && mic && bargeRun * mic.chunkMs >= bargeMs) {
             bargeWindow = true

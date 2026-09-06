@@ -176,20 +176,31 @@ export class AudioPlayer extends EventEmitter {
   }
 
   _spawn() {
-    // Test/CI hook: a stand-in player command when the real sound server is
-    // not available (e.g. `cat` just drains the stream).
-    const cmd = process.env.HERDR_VOICE_PLAYER_CMD ?? 'pacat'
+    // Platform backends: ffplay on macOS (unchanged from upstream), pacat on
+    // Linux (low-latency raw streaming into PipeWire/PulseAudio).
+    // Test/CI hook: HERDR_VOICE_PLAYER_CMD forces a stand-in command when no
+    // real player exists (e.g. `cat` just drains the stream).
+    const isDarwin = process.platform === 'darwin'
+    const cmd = process.env.HERDR_VOICE_PLAYER_CMD ?? (isDarwin ? 'ffplay' : 'pacat')
     const args =
-      cmd === 'pacat'
+      cmd === 'ffplay'
         ? [
-            '--raw',
-            '--format=s16le',
-            `--rate=${SAMPLE_RATE}`,
-            '--channels=1',
-            '--latency-msec=120',
-            '--client-name=herdr-voice',
+            '-hide_banner', '-loglevel', 'error',
+            '-nodisp', '-autoexit',
+            '-fflags', 'nobuffer', '-flags', 'low_delay',
+            '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ch_layout', 'mono',
+            '-i', 'pipe:0',
           ]
-        : []
+        : cmd === 'pacat'
+          ? [
+              '--raw',
+              '--format=s16le',
+              `--rate=${SAMPLE_RATE}`,
+              '--channels=1',
+              '--latency-msec=120',
+              '--client-name=herdr-voice',
+            ]
+          : []
     const proc = spawn(cmd, args)
     proc.stderr.on('data', () => {})
     proc.on('error', (e) => {
