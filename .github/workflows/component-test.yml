@@ -18,4 +18,4 @@ jobs:
       - name: Install dependencies
         run: npm install --omit=dev --no-fund --no-audit
       - name: Run component tests (fake mic, captured speakers, scripted Realtime server)
-        run: node test/component/barge.test.mjs
+        run: npm test

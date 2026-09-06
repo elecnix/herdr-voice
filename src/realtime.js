@@ -57,7 +57,12 @@ export class RealtimeSession extends EventEmitter {
       }, Number(process.env.HERDR_VOICE_ROTATE_MS ?? 55 * 60 * 1000))
       this.rotationTimer.unref?.()
     })
+    const sock = ws
     ws.on('message', (raw) => {
+      // A retiring socket can still deliver late events for ~1s after
+      // reconnect() opened its replacement — they must not mutate the new
+      // session's state.
+      if (this.ws !== sock) return
       let ev
       try {
         ev = JSON.parse(raw.toString())
@@ -67,7 +72,6 @@ export class RealtimeSession extends EventEmitter {
       this._handle(ev)
     })
     ws.on('error', (err) => this.emit('status', { state: 'error', message: err.message }))
-    const sock = ws
     ws.on('close', (code) => {
       if (code >= 4000 && code < 5000) {
         this.ready = false
@@ -200,6 +204,11 @@ export class RealtimeSession extends EventEmitter {
     // Quirk 2: dedupe — the same call arrives via two event paths.
     if (!name || !callId || this.handledCallIds.has(callId)) return
     this.handledCallIds.add(callId)
+    if (this.handledCallIds.size > 500) {
+      // bound the dedupe set: drop the oldest half (insertion order)
+      const ids = [...this.handledCallIds].slice(0, 250)
+      for (const id of ids) this.handledCallIds.delete(id)
+    }
     let args = {}
     try {
       args = JSON.parse(argsRaw || '{}')
@@ -352,6 +361,13 @@ export class RealtimeSession extends EventEmitter {
   }
 
   close() {
+    // User-initiated stop: mark intent BEFORE closing — the close event is
+    // async and must not re-arm the reconnect ladder. (This flag was lost in
+    // a file copy once; core.stop() masks it with process.exit, but any
+    // caller that doesn't exit immediately would re-dial OpenAI after 2s.)
+    this.intentionalClose = true
+    clearTimeout(this.rotationTimer)
+    clearTimeout(this.reconnectTimer)
     this.ws?.close()
   }
 

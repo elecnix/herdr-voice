@@ -8,7 +8,8 @@
     "test:e2e": "node test/e2e.mjs",
     "sandbox": "python3 scripts/sandbox.py voicelab",
     "test:component": "node test/component/barge.test.mjs",
-    "test:live": "node test/live/audio-chain.test.mjs"
+    "test:live": "node test/live/audio-chain.test.mjs",
+    "test": "node test/component/barge.test.mjs && node test/component/reconnect.test.mjs && node test/component/rotation.test.mjs"
   },
   "keywords": [],
   "author": "",
