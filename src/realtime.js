@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { MODEL, VOICE, SAMPLE_RATE } from './config.js'
 import { REALTIME_TOOLS, INSTRUCTIONS } from './tools.js'
 
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime'
+const REALTIME_URL = process.env.HERDR_VOICE_WS_URL ?? 'wss://api.openai.com/v1/realtime'
 
 /**
  * Node-side Realtime session over WebSocket.
@@ -27,6 +27,7 @@ export class RealtimeSession extends EventEmitter {
     this.responseActive = false
     this.pendingResponse = false
     this.handledCallIds = new Set()
+    this.reconnectAttempts = 0
     this.assistantBuffer = ''
   }
 
@@ -37,8 +38,28 @@ export class RealtimeSession extends EventEmitter {
     })
     this.ws = ws
 
-    ws.on('open', () => this._configure())
+    ws.on('open', () => {
+      this.reconnectAttempts = 0
+      this._configure()
+      // Proactive rotation: re-open a fresh session before the 60-minute cap.
+      clearTimeout(this.rotationTimer)
+      this.rotationTimer = setTimeout(() => {
+        // Idle-aware: rotating mid-response (or mid tool call) would swallow
+        // in-flight results — defer a few seconds until the session is quiet.
+        if (this.responseActive || this.pendingResponse) {
+          this.rotationTimer.refresh()
+          return
+        }
+        this.reconnect()
+      }, Number(process.env.HERDR_VOICE_ROTATE_MS ?? 55 * 60 * 1000))
+      this.rotationTimer.unref?.()
+    })
+    const sock = ws
     ws.on('message', (raw) => {
+      // A retiring socket can still deliver late events for ~1s after
+      // reconnect() opened its replacement — they must not mutate the new
+      // session's state.
+      if (this.ws !== sock) return
       let ev
       try {
         ev = JSON.parse(raw.toString())
@@ -49,10 +70,61 @@ export class RealtimeSession extends EventEmitter {
     })
     ws.on('error', (err) => this.emit('status', { state: 'error', message: err.message }))
     ws.on('close', (code) => {
+      if (code >= 4000 && code < 5000) {
+        this.ready = false
+        clearTimeout(this.rotationTimer)
+        clearTimeout(this.reconnectTimer)
+        this.emit('status', { state: 'closed-final', code })
+        return
+      }
+      // Superseded socket (reconnect already opened a replacement): its close
+      // event must NOT schedule anything. Without this guard every rotation
+      // and every reconnect scheduled a SECOND reconnect from the old
+      // socket's async close event, which then closed the LIVE session —
+      // an endless reconnect cascade (one new session every ~2s, forever).
+      if (this.ws !== sock) return
       this.ready = false
+      clearTimeout(this.rotationTimer)
       this.emit('status', { state: 'closed', code })
+      // Auto-reconnect unless the user closed the session. OpenAI hard-caps
+      // Realtime sessions at 60 minutes — without this, the agent dies hourly.
+      // A successful (re)connect resets the backoff ladder.
+      if (!this.intentionalClose) this._scheduleReconnect()
     })
     return this
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return
+    // Exponential backoff with jitter: 0.5s, 1s, 2s ... capped at 8s. Auth
+    // and policy failures (4xxx close codes) are fatal — retrying them is
+    // the 'constantly reconnecting' experience with no chance of success.
+    const delay = Math.min(8000, 500 * 2 ** this.reconnectAttempts) + Math.random() * 250
+    this.reconnectAttempts++
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.reconnect()
+    }, delay)
+  }
+
+  /** Fresh session (new 60-minute window). Used for auto-reconnect and
+   *  proactive rotation before the cap. Conversation context resets; herdr
+   *  state is re-read live by the tools, so nothing else is lost. */
+  reconnect() {
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    const old = this.ws
+    this.ws = null // detach first: the old socket's close event must not reschedule
+    try { old?.close() } catch { /* already gone */ }
+    setTimeout(() => {
+      try { old?.terminate() } catch { /* already gone */ }
+    }, 1000).unref?.()
+    this.responseActive = false
+    this.pendingResponse = false
+    this.assistantBuffer = ''
+    this._partials?.clear()
+    this.ready = false
+    this.connect()
   }
 
   _send(obj) {
@@ -127,6 +199,11 @@ export class RealtimeSession extends EventEmitter {
     // Quirk 2: dedupe — the same call arrives via two event paths.
     if (!name || !callId || this.handledCallIds.has(callId)) return
     this.handledCallIds.add(callId)
+    if (this.handledCallIds.size > 500) {
+      // bound the dedupe set: drop the oldest half (insertion order)
+      const ids = [...this.handledCallIds].slice(0, 250)
+      for (const id of ids) this.handledCallIds.delete(id)
+    }
     let args = {}
     try {
       args = JSON.parse(argsRaw || '{}')
@@ -224,6 +301,13 @@ export class RealtimeSession extends EventEmitter {
   }
 
   close() {
+    // User-initiated stop: mark intent BEFORE closing — the close event is
+    // async and must not re-arm the reconnect ladder. (This flag was lost in
+    // a file copy once; core.stop() masks it with process.exit, but any
+    // caller that doesn't exit immediately would re-dial OpenAI after 2s.)
+    this.intentionalClose = true
+    clearTimeout(this.rotationTimer)
+    clearTimeout(this.reconnectTimer)
     this.ws?.close()
   }
 }
