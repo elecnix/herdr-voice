@@ -42,7 +42,21 @@ export class RealtimeSession extends EventEmitter {
     })
     this.ws = ws
 
-    ws.on('open', () => this._configure())
+    ws.on('open', () => {
+      this._configure()
+      // Proactive rotation: OpenAI hard-caps Realtime sessions at 60 minutes.
+      // Re-open a fresh session before the cap so long-running voice sessions
+      // never hit it. Conversation context resets; herdr state is re-read
+      // live by the tools, so nothing else is lost.
+      clearTimeout(this.rotationTimer)
+      this.rotationTimer = setTimeout(() => {
+        this.intentionalClose = true
+        try { this.ws?.close() } catch { /* already gone */ }
+        this.intentionalClose = false
+        this.reconnect()
+      }, 55 * 60 * 1000)
+      this.rotationTimer.unref?.()
+    })
     ws.on('message', (raw) => {
       let ev
       try {
@@ -55,9 +69,34 @@ export class RealtimeSession extends EventEmitter {
     ws.on('error', (err) => this.emit('status', { state: 'error', message: err.message }))
     ws.on('close', (code) => {
       this.ready = false
+      clearTimeout(this.rotationTimer)
       this.emit('status', { state: 'closed', code })
+      // Auto-reconnect unless the session was closed on purpose (user stop or
+      // proactive rotation). Without this, a network blip or the 60-minute
+      // server-side cap silently ends the voice session for good.
+      if (!this.intentionalClose) this._scheduleReconnect()
     })
     return this
+  }
+
+  _scheduleReconnect() {
+    if (this.reconnectTimer) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.reconnect()
+    }, 2000)
+  }
+
+  /** Tear down and re-open the Realtime session with fresh state. */
+  reconnect() {
+    try { this.ws?.close() } catch { /* already gone */ }
+    this.responseActive = false
+    this.pendingResponse = false
+    this.assistantBuffer = ''
+    this.interruptedForResponse = false
+    this._partials?.clear()
+    this.ready = false
+    this.connect()
   }
 
   _send(obj) {
@@ -257,6 +296,15 @@ export class RealtimeSession extends EventEmitter {
   }
 
   close() {
+    this.intentionalClose = true
+    clearTimeout(this.rotationTimer)
+    clearTimeout(this.reconnectTimer)
     this.ws?.close()
+  }
+
+  /** Manual barge-in: cancel the in-flight response and free the turn. */
+  cancelResponse() {
+    if (this.responseActive) this._send({ type: 'response.cancel' })
+    this._releaseResponse()
   }
 }
