@@ -30,7 +30,7 @@ title = "voice"
 placement = "split"
 # macOS: HUD renderer attached to the engine started by the summon flow.
 # Linux: no summon daemon — run the all-in-one engine + full TUI in the pane.
-command = ["sh", "-c", "if [ \"$(uname)\" = Darwin ]; then exec node src/ui.js; else exec node src/index.js --full; fi"]
+command = ["sh", "-c", "if [ \"$(uname)\" = Darwin ]; then exec node src/ui.js; else [ -f \"$HOME/.config/herdr/plugins/config/herdr-voice/env\" ] && . \"$HOME/.config/herdr/plugins/config/herdr-voice/env\"; exec node src/index.js --full; fi"]
 
 # All-in-one popup (engine + UI in one process on this host). Modal while open;
 # useful on a single machine with a real microphone, or for text-only control.
