@@ -167,3 +167,57 @@ Check what's visible with:
 ```bash
 ffmpeg -f avfoundation -list_devices true -i "" 2>&1 | grep -A5 "audio devices"
 ```
+
+## Linux support
+
+Linux works through PulseAudio/PipeWire and needs the same two binaries the
+macOS path already uses:
+
+```bash
+# Debian/Ubuntu: ffmpeg (mic capture + fallback playback) and pipewire-audio
+sudo apt install ffmpeg pipewire-audio
+```
+
+- **Microphone**: capture sources are enumerated with `pactl list sources`
+  (monitors/loopbacks are filtered like macOS virtual devices), and capture
+  runs through `ffmpeg -f pulse`. The special device name `default` follows
+  the desktop's own input selection.
+- **Playback**: `pacat` streams the assistant's PCM straight into the sound
+  server with a small fixed buffer (~120 ms), which keeps barge-in latency low
+  and playback in order. `--latency-msec` can be tuned if your setup needs it.
+- **Echo cancellation (speakers instead of headphones)**: without it, the
+  agent's own voice leaking into the mic looks like an interruption. Load
+  PipeWire's echo canceller once per boot:
+
+  ```bash
+  pactl load-module module-echo-cancel aec_method=webrtc \
+    source_name=echocancel_src sink_name=echocancel_sink
+  ```
+
+  Then run the docked pane with `PULSE_SOURCE=echocancel_src
+  PULSE_SINK=echocancel_sink` in its environment (e.g. in a wrapper command).
+
+## Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HERDR_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model; `gpt-realtime-2.1-mini` is ~3x cheaper audio with weaker tool orchestration |
+| `HERDR_VOICE_FULL_DUPLEX` | unset | Set to `1` to disable the echo gate (headphones: the mic stays open while the agent speaks, for true full-duplex barge-in) |
+| `HERDR_VOICE_SOCKET` / `--socket` | auto | Drive a specific herdr session socket |
+| `HERDR_VOICE_CTL` | `~/.cache/herdr-voice/ctl.sock` | Control socket for the split engine/HUD topology |
+| `HERDR_VOICE_HANDS_HOST` | — | SSH host of the mic machine for the remote topology |
+
+## Sessions, rotation, and barge-in behavior
+
+- OpenAI ends Realtime sessions server-side after **60 minutes**. The session
+  is proactively rotated at 55 minutes and unexpected closes auto-reconnect
+  after 2 seconds, so long-running voice sessions survive; conversation
+  context resets at each rotation (herdr state is re-read live by the tools).
+- While the agent is speaking, the microphone is **echo-gated** to silence
+  (half-duplex) unless `HERDR_VOICE_FULL_DUPLEX=1` — speaker leakage otherwise
+  looks like an interruption to server-side VAD and truncates the reply.
+- Voice barge-in is **evidence-gated**: a running response is interrupted only
+  when live dictation from a *new* conversation item has transcribed real
+  words (≥3 characters). The transcription of the sentence being answered
+  arrives late and never counts; stray noise cannot cancel a response. Press
+  `b` for an unconditional manual barge-in.
