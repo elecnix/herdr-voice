@@ -79,7 +79,14 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     ui.updateAssistant(text, true)
     if (text) transcript.assistant(text)
   })
+  // Echo gate: while agent audio is streaming (plus a short tail) the mic
+  // sends silence, so the agent's own voice leaking through speakers cannot
+  // trigger server-side VAD and truncate its response. Declared here because
+  // the audio handler refreshes the tail on every streamed chunk.
+  const fullDuplex = process.env.HERDR_VOICE_FULL_DUPLEX === '1'
+  let agentAudioTail = 0
   session.on('audio', (b64) => {
+    agentAudioTail = Date.now() + 800
     if (soundOn) player.play(b64)
   })
 
@@ -124,6 +131,13 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
       ui.addSystem(`mic: ${micDevice ?? picked.name} — unmute to talk`)
       mic.on('chunk', (b64) => session.sendAudio(b64))
       mic.on('level', (l) => ui.setMic({ level: l }))
+      if (!fullDuplex) {
+        // The gate flips ~200 ms after playback starts and releases shortly
+        // after the last streamed chunk, keeping the server's view of the
+        // user turn clean end to end.
+        const gateTimer = setInterval(() => mic?.setGate(Date.now() < agentAudioTail), 200)
+        gateTimer.unref?.()
+      }
       mic.on('error', (e) => {
         ui.setMic({ available: false })
         ui.addSystem(`mic error: ${e.message}`)

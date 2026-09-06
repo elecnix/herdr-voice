@@ -17,6 +17,16 @@ export class MicCapture extends EventEmitter {
     this.proc = null
     this.muted = true
     this.stderr = ''
+    // Echo gate: while the agent is speaking, mic chunks are replaced with
+    // silence so server-side VAD cannot hear the agent's own voice leaking
+    // through speakers and truncate its response mid-sentence. Half-duplex
+    // by design; HERDR_VOICE_FULL_DUPLEX=1 disables the gate entirely
+    // (headphones: true full-duplex barge-in with no echo to suppress).
+    this.gate = false
+  }
+
+  setGate(on) {
+    this.gate = on
   }
 
   static async listDevices() {
@@ -103,10 +113,15 @@ export class MicCapture extends EventEmitter {
       while (pending.length >= chunkBytes) {
         const chunk = pending.subarray(0, chunkBytes)
         pending = pending.subarray(chunkBytes)
-        if (!this.muted) {
+        if (this.muted || this.gate) {
+          // Zero-filled chunks keep the audio stream (and VAD turn state)
+          // alive without letting speaker leakage reach the server. Cutting
+          // the stream instead would freeze the turn mid-flight.
+          this.emit('chunk', Buffer.alloc(chunkBytes).toString('base64'))
+        } else {
           this.emit('chunk', chunk.toString('base64'))
-          this.emit('level', rms(chunk))
         }
+        this.emit('level', rms(chunk))
       }
     })
     proc.stderr.on('data', (d) => {
