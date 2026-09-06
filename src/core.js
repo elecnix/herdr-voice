@@ -179,7 +179,10 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     // source — barge-in then dies with no error anywhere. Verify, self-heal
     // once, and if it still fails: refuse the mic loudly (text mode works).
     const configured = process.env.HERDR_VOICE_MIC_SOURCE ?? process.env.PULSE_SOURCE
-    if (configured && !configured.startsWith('file:') && process.platform !== 'darwin') {
+    // HERDR_VOICE_MIC_SOURCE means test/file mode (audio.js reads it as an
+    // ffmpeg input) — no PulseAudio source to verify, and the self-heal must
+    // not load modules during component tests.
+    if (configured && !process.env.HERDR_VOICE_MIC_SOURCE && !configured.startsWith('file:') && process.platform !== 'darwin') {
       const sourceExists = () => {
         try {
           const out = execFileSync('pactl', ['list', 'short', 'sources'], {
