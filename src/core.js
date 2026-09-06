@@ -4,6 +4,11 @@ import { MicCapture, AudioPlayer } from './audio.js'
 import { createExecutor, readState } from './tools.js'
 import { TranscriptStore, copyToClipboard } from './transcript.js'
 
+// A voice session dying silently is the worst failure mode (the pane just
+// vanishes with no trace). Surface anything that would otherwise be lost.
+process.on('unhandledRejection', (e) => console.error('[voice] unhandled rejection:', e?.stack ?? e))
+process.on('uncaughtException', (e) => console.error('[voice] uncaught exception:', e?.stack ?? e))
+
 /**
  * Shared voice-core wiring used by both process shapes:
  *  - index.js  — UI and engine in one process (the standalone floating window)
@@ -111,21 +116,32 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   )
   gateTimer.unref?.()
   session.on('response_created', () => {
+    suppressAudio = false
     bargeWindow = false
     bargeRun = 0
   })
 
-  session.on('audio', (b64) => {
-    agentAudioTail = Date.now() + 500
-    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} PLAY +${b64.length}b64chars\n`) } catch {}
-    if (soundOn) player.play(b64)
-  })
-  session.on('interrupt', () => player.flush())
-  session.on('barge', () => {
+  // After any barge-in, the cancelled response's remaining audio keeps
+  // arriving over the socket (the server takes a moment to process the
+  // cancel). Every delta would re-arm the player, so the old answer kept
+  // talking over the user even though the transcript showed the new reply.
+  // Suppression drops those stale deltas and lifts only when the NEXT
+  // response is created — i.e. when the answer to the interruption starts.
+  let suppressAudio = false
+  const bargeIn = () => {
+    suppressAudio = true
     player.flush()
     session.cancelResponse()
     ui.setSpeaking(false)
+  }
+  session.on('audio', (b64) => {
+    agentAudioTail = Date.now() + 500
+    if (suppressAudio) return
+    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} PLAY +${b64.length}b64chars\n`) } catch {}
+    if (soundOn) player.play(b64)
   })
+  session.on('interrupt', bargeIn)
+  session.on('barge', bargeIn)
 
   session.on('tool_call', async ({ name, callId, args }) => {
     ui.addToolCall({ callId, name, args })
@@ -181,9 +197,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
           if (!bargeWindow && mic && bargeRun * mic.chunkMs >= bargeMs) {
             bargeWindow = true
             mic.setGate(false) // server starts hearing the user live
-            player.flush()
-            session.cancelResponse()
-            ui.setSpeaking(false)
+            bargeIn()
             ui.notify('listening — agent paused')
           }
         }
