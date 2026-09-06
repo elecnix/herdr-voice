@@ -68,10 +68,17 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     if (s.state === 'ready') ui.addSystem('connected — say or type a command')
   })
   session.on('speech', ({ active }) => ui.setSpeaking(active))
-  session.on('user_partial', ({ text }) => ui.setPartial(text))
-  session.on('user_transcript', ({ text, done }) => {
+  // Live dictation arrives BEFORE the response text (server transcribes its
+  // own VAD commit asynchronously), so render the user's turn the moment
+  // words are dictated — otherwise the assistant reply renders above the
+  // question it answers.
+  session.on('user_partial', ({ itemId, text }) => {
+    ui.setPartial(text)
+    ui.addOrUpdateUser?.(itemId, text, false)
+  })
+  session.on('user_transcript', ({ itemId, text, done }) => {
     if (!text) return
-    ui.addUser(text, { done })
+    ui.addOrUpdateUser?.(itemId, text, done)
     if (done) transcript.user(text)
   })
   session.on('assistant_delta', ({ text }) => ui.updateAssistant(text, false))

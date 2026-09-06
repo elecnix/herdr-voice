@@ -157,6 +157,20 @@ export class VoiceTUI extends EventEmitter {
     } else this.transcript.push({ role: 'you', text, done })
     this.dirty = true
   }
+
+  /** Upsert the user turn for a specific conversation item id. Live dictation
+   *  creates the entry (undone) as the user speaks, so the user's line exists
+   *  BEFORE the assistant reply starts streaming — otherwise the reply renders
+   *  above the question it answers, because input transcription completes
+   *  later than the response text. */
+  addOrUpdateUser(itemId, text, done) {
+    const found = this.transcript.find((t) => t.userItemId === itemId)
+    if (found) {
+      found.text = text
+      found.done = done
+    } else this.transcript.push({ role: 'you', text, done, userItemId: itemId })
+    this.dirty = true
+  }
   updateAssistant(text, done = false) {
     const last = this.transcript[this.transcript.length - 1]
     if (last && last.role === 'ai' && !last.done) {
