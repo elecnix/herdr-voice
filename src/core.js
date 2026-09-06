@@ -125,10 +125,14 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     suppressAudio = false
     bargeWindow = false
     bargeRun = 0
-    // NOTE: playbackStart/queuedAudioSec are deliberately NOT reset here —
-    // the previous response's audio may still be buffered in the speaker
-    // when the next response begins (tool-call chains). The schedule is
-    // monotonic and only a flush (barge-in/stop) rewinds it.
+    // Re-base the playback schedule for the new response. The MONOTONIC
+    // tail (agentAudioTail only extends) carries the previous response's
+    // still-buffered audio: the old tail stays in force until the new
+    // schedule overtakes it. (Rebasing is essential — without it the start
+    // timestamp goes stale and the tail computes into the past, leaving the
+    // gate permanently open: the AI hears itself.)
+    playbackStart = 0
+    queuedAudioSec = 0
   })
 
   // After any barge-in, the cancelled response's remaining audio keeps
