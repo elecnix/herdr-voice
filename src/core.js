@@ -176,6 +176,13 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     },
     submit(text) {
       transcript.user(text, { typed: true })
+      // Typed input preempts a running response: stop generation and drop the
+      // queued playback now, so the new answer starts speaking immediately
+      // instead of being queued behind the remainder of the old one.
+      if (session.responseActive) {
+        player.flush()
+        session.cancelResponse()
+      }
       session.sendText(text)
     },
     stop() {
