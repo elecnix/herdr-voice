@@ -57,6 +57,8 @@ async function main() {
   ui.on('copy', () => core.copy(false))
   ui.on('copy-all', () => core.copy(true))
   ui.on('submit', core.submit)
+  ui.on('barge', () => core.bargeIn())
+  ui.on('stop-audio', () => core.stopAudio())
 
   const shutdown = () => {
     core.stop()

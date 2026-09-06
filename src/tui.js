@@ -101,24 +101,33 @@ export class VoiceTUI extends EventEmitter {
   }
 
   _key(k) {
-    if (k === '' || k === '') return this.emit('quit') // ctrl-c/d
-    if (k === '\t') return this.emit('toggle-mute')
-    if (k === 'b') return this.emit('barge')
-    if (k === '\r' || k === '\n') {
-      const text = this.input.trim()
-      this.input = ''
-      this.dirty = true
-      if (text) this.emit('submit', text)
-      return
+    // Escape sequences (arrows, F-keys...) arrive as multi-char chunks - ignore
+    // them whole. A LONE ESC chunk is the stop-audio key.
+    if (k === '\x1b') return this.emit('stop-audio')
+    if (k.startsWith('\x1b')) return
+    // Handle chunk-wise input: programmatic send_text (and fast typists)
+    // deliver several characters in one chunk - process per character so
+    // control characters keep working no matter how they are batched.
+    for (const ch of k) {
+      if (ch === '\x03' || ch === '\x04') return this.emit('quit') // ctrl-c/d
+      if (ch === '\t') return this.emit('toggle-mute')
+      if (ch === 'b') {
+        this.emit('barge')
+        continue
+      }
+      if (ch === '\r' || ch === '\n') {
+        const text = this.input.trim()
+        this.input = ''
+        if (text) this.emit('submit', text)
+        continue
+      }
+      if (ch === '\x7f' || ch === '\b') {
+        this.input = this.input.slice(0, -1)
+        continue
+      }
+      if (ch.charCodeAt(0) < 32) continue
+      this.input += ch
     }
-    if (k === '' || k === '\b') {
-      this.input = this.input.slice(0, -1)
-      this.dirty = true
-      return
-    }
-    // ignore control/escape sequences, accept printable text
-    if (k.charCodeAt(0) < 32 || k.startsWith('\x1b')) return
-    this.input += k
     this.dirty = true
   }
 
@@ -159,11 +168,9 @@ export class VoiceTUI extends EventEmitter {
     this.dirty = true
   }
 
-  /** Upsert the user turn for a specific conversation item id. Live dictation
-   *  creates the entry (undone) as the user speaks, so the user's line exists
-   *  BEFORE the assistant reply starts streaming — otherwise the reply renders
-   *  above the question it answers, because input transcription completes
-   *  later than the response text. */
+  /** Upsert the user turn for a specific item id: live dictation creates it
+   *  (undone) BEFORE the assistant starts replying, so the reply can never
+   *  render above the question it answers. */
   addOrUpdateUser(itemId, text, done) {
     const found = this.transcript.find((t) => t.userItemId === itemId)
     if (found) {
@@ -292,7 +299,7 @@ export class VoiceTUI extends EventEmitter {
         ? `${C.faint}muted${C.off}`
         : `${C.ok}live${C.off}`
     const spk = this.speaking ? `${C.accent}◉ hearing you${C.off}` : ''
-    const keys = `${C.faint}[tab] mute  [b] barge-in  [enter] send  [ctrl-c] quit${C.off}`
+    const keys = `${C.faint}[tab] mute  [b] barge-in  [esc] stop audio  [enter] send  [ctrl-c] quit${C.off}`
     out.push(
       `${C.faint}│${C.off} ${pad(`${C.dim}mic${C.off} ${micTag} ${meter} ${spk}`, W - 5 - strip(keys).length)} ${keys} ${C.faint}│${C.off}`
     )

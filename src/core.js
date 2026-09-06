@@ -100,16 +100,18 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   // user live. The threshold adapts to the room's noise floor; set
   // HERDR_VOICE_BARGE_LEVEL to force an absolute level, or 0 to disable.
   const fullDuplex = process.env.HERDR_VOICE_FULL_DUPLEX === '1'
-  const bargeLevelOverride = Number(process.env.HERDR_VOICE_BARGE_LEVEL ?? NaN)
+  // Barge-in speech level, calibrated for the echo-cancelled mic stream:
+  // ambient sits around 0.002-0.005, a speaking voice around 0.011+. An
+  // adaptive floor proved unreliable here (the AEC'd stream is near-digital
+  // silence when quiet, so any adaptation collapsed the threshold). Override
+  // with HERDR_VOICE_BARGE_LEVEL; 0 disables client-side barge-in.
+  const bargeLevel = Number.isFinite(Number(process.env.HERDR_VOICE_BARGE_LEVEL))
+    ? Number(process.env.HERDR_VOICE_BARGE_LEVEL)
+    : 0.008
   const bargeMs = Number(process.env.HERDR_VOICE_BARGE_MS ?? 300)
   let agentAudioTail = 0
   let bargeWindow = false // gate lifted: user is talking over the agent
   let bargeRun = 0 // consecutive chunks above the speech threshold
-  let noiseFloor = 0.002
-  const bargeThreshold = () =>
-    Number.isFinite(bargeLevelOverride)
-      ? bargeLevelOverride
-      : Math.min(0.5, Math.max(0.004, noiseFloor * 8))
   const gateTimer = setInterval(
     () => mic?.setGate(fullDuplex ? false : !bargeWindow && Date.now() < agentAudioTail),
     200
@@ -133,6 +135,10 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     player.flush()
     session.cancelResponse()
     ui.setSpeaking(false)
+  }
+  const stopAudio = () => {
+    bargeIn()
+    ui.notify('audio stopped')
   }
   session.on('audio', (b64) => {
     agentAudioTail = Date.now() + 500
@@ -184,16 +190,23 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
       ui.addSystem(`mic: ${micDevice ?? picked.name} — unmute to talk`)
       mic.on('chunk', (b64) => session.sendAudio(b64))
       mic.on('level', (l) => {
-        // Adaptive noise floor: snaps down to any quieter sample, creeps up
-        // slowly through louder ones — so speech is measured against the
-        // room, not a magic constant.
-        noiseFloor = l < noiseFloor ? l : noiseFloor + (l - noiseFloor) * 0.05
         ui.setMic({ level: l })
         const gated = Date.now() < agentAudioTail
-        if (fullDuplex || (!gated && !session.responseActive) || bargeLevelOverride === 0) {
+        // Muted means the user silenced the mic on purpose — never barge in
+        // on their behalf.
+        if (fullDuplex || mic?.muted || (!gated && !session.responseActive) || bargeLevel === 0) {
           bargeRun = 0
         } else {
-          bargeRun = l >= bargeThreshold() ? bargeRun + 1 : 0
+          const thr = bargeLevel
+          bargeRun = l >= thr ? bargeRun + 1 : 0
+          if (l >= thr || bargeRun > 0) {
+            try {
+              fs.appendFileSync(
+                '/tmp/herdr-voice-ws.log',
+                `${new Date().toISOString()} BARGE lvl=${l.toFixed(4)} thr=${thr.toFixed(4)} run=${bargeRun}\n`
+              )
+            } catch {}
+          }
           if (!bargeWindow && mic && bargeRun * mic.chunkMs >= bargeMs) {
             bargeWindow = true
             mic.setGate(false) // server starts hearing the user live
@@ -214,6 +227,8 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   return {
     session,
     transcript,
+    bargeIn: () => bargeIn(),
+    stopAudio,
     get micLive() {
       return Boolean(mic && !mic.muted)
     },

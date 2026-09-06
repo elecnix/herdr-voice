@@ -203,7 +203,7 @@ sudo apt install ffmpeg pipewire-audio
 | --- | --- | --- |
 | `HERDR_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model; `gpt-realtime-2.1-mini` is ~3x cheaper audio with weaker tool orchestration |
 | `HERDR_VOICE_FULL_DUPLEX` | unset | Set to `1` to disable the echo gate (headphones: the mic stays open while the agent speaks, for true full-duplex barge-in) |
-| `HERDR_VOICE_BARGE_LEVEL` | adaptive | Absolute mic RMS level that counts as barge-in speech (0 disables client-side barge-in; unset derives the threshold from the room's noise floor) |
+| `HERDR_VOICE_BARGE_LEVEL` | `0.008` | Mic RMS level (on the echo-cancelled stream) that counts as barge-in speech; ambient sits ~0.002-0.005, a speaking voice ~0.011+. `0` disables client-side barge-in. |
 | `HERDR_VOICE_BARGE_MS` | `300` | How long the mic must stay above the barge-in level before the agent pauses for you |
 | `HERDR_VOICE_SOCKET` / `--socket` | auto | Drive a specific herdr session socket |
 | `HERDR_VOICE_CTL` | `~/.cache/herdr-voice/ctl.sock` | Control socket for the split engine/HUD topology |
@@ -219,11 +219,12 @@ sudo apt install ffmpeg pipewire-audio
   (half-duplex) unless `HERDR_VOICE_FULL_DUPLEX=1` — speaker leakage otherwise
   looks like an interruption to server-side VAD and truncates the reply.
   Because the gate deafens the server, barge-in is detected **client-side**:
-  the raw mic level (which bypasses the gate) is watched against an adaptive
-  noise-floor threshold, and sustained speech opens the gate, cancels the
-  response, and flushes playback so the server hears you live. Tune with
-  `HERDR_VOICE_BARGE_LEVEL` / `HERDR_VOICE_BARGE_MS`, or press `b` for an
-  unconditional manual barge-in.
+  the raw mic level (which bypasses the gate) is watched against a fixed
+  threshold calibrated for the echo-cancelled stream, and sustained speech
+  opens the gate, cancels the response, and flushes playback so the server
+  hears you live. Tune with `HERDR_VOICE_BARGE_LEVEL` /
+  `HERDR_VOICE_BARGE_MS`, press `b` for an unconditional manual barge-in,
+  or press `esc` to stop the audio dead.
 - When the agent is *not* playing audio, barge-in is **evidence-gated**: a
   running response is interrupted only when live dictation from a *new*
   conversation item has transcribed real words (≥3 characters). The
