@@ -21,6 +21,33 @@ export class MicCapture extends EventEmitter {
 
   static async listDevices() {
     return new Promise((resolve) => {
+      if (process.platform !== 'darwin') {
+        // Linux: PulseAudio/PipeWire capture sources via pactl. Monitors are
+        // loopbacks of output sinks — virtual devices, filtered like BlackHole.
+        const p = spawn('pactl', ['list', 'sources'], {
+          env: { ...process.env, LANG: 'C', LC_ALL: 'C' }, // pactl output is localized
+        })
+        let buf = ''
+        p.stdout.on('data', (d) => (buf += d.toString()))
+        p.on('close', () => {
+          const audio = []
+          let cur = null
+          for (const line of buf.split('\n')) {
+            const name = line.match(/^\s*Name:\s*(\S+)/)
+            const desc = line.match(/^\s*Description:\s*(.+?)\s*$/)
+            if (name) {
+              cur = { index: name[1], name: name[1] }
+            } else if (desc && cur) {
+              cur.name = desc[1]
+              if (!cur.index.endsWith('.monitor')) audio.push(cur)
+              cur = null
+            }
+          }
+          resolve(audio)
+        })
+        p.on('error', () => resolve([]))
+        return
+      }
       const p = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', ''])
       let buf = ''
       p.stderr.on('data', (d) => (buf += d.toString()))
@@ -45,17 +72,20 @@ export class MicCapture extends EventEmitter {
    */
   static pickDevice(devices) {
     const VIRTUAL = /teams|virtual|blackhole|loopback|soundflower|aggregate|zoomaudio|multi-output/i
-    const PREFERRED = /macbook.*microphone|built-in|external microphone|usb|airpods|studio display/i
+    const PREFERRED = /macbook.*microphone|built-in|external microphone|usb|airpods|studio display|microphone|webcam|headset|audio controller/i
     const real = devices.filter((d) => !VIRTUAL.test(d.name))
     if (real.length === 0) return null
     return real.find((d) => PREFERRED.test(d.name)) ?? real[0]
   }
 
   start() {
+    const isDarwin = process.platform === 'darwin'
+    // On Linux, a legacy avfoundation-style index (":0") means "just use default".
+    const input = !isDarwin && /^:\d+$/.test(this.device) ? 'default' : this.device
     const args = [
       '-hide_banner', '-loglevel', 'error',
-      '-f', 'avfoundation',
-      '-i', this.device,
+      '-f', isDarwin ? 'avfoundation' : 'pulse',
+      '-i', input,
       '-ar', String(SAMPLE_RATE),
       '-ac', '1',
       '-f', 's16le',

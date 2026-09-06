@@ -116,7 +116,9 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
           : 'no microphone available — grant mic permission (System Settings > Privacy & Security > Microphone). Text input still works.'
       )
     } else {
-      const device = micDevice ?? `:${picked.index}`
+      // macOS addresses inputs as avfoundation indices (":0"); Linux uses the
+      // PulseAudio source name, and "default" follows the desktop's selection.
+      const device = micDevice ?? (process.platform === 'darwin' ? `:${picked.index}` : 'default')
       mic = new MicCapture({ device }).start()
       ui.setMic({ available: true, muted: true })
       ui.addSystem(`mic: ${micDevice ?? picked.name} — unmute to talk`)
