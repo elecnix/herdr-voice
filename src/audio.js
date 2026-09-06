@@ -133,10 +133,18 @@ export class MicCapture extends EventEmitter {
 }
 
 /**
- * Playback of assistant PCM16 audio through a long-lived ffplay stdin pipe.
- * NOTE: ffplay rejects `-ac` (that silently killed audio out for days — every
- * play exited code 1 unseen). Channel count must be `-ch_layout mono`, and any
- * player death is surfaced via 'error' and recovered by respawning on next play.
+ * Playback of assistant PCM16 audio through a long-lived stdin pipe.
+ * macOS: ffplay (unchanged from the original implementation — NOTE: ffplay
+ * rejects `-ac` (that silently killed audio out for days — every play exited
+ * code 1 unseen). Channel count must be `-ch_layout mono`.)
+ * Linux: pacat, which streams raw s16le straight into PipeWire/PulseAudio
+ * with a small fixed server-side buffer. ffplay was unusable on Linux for
+ * live streaming: its demuxer queue adds variable multi-second latency and
+ * -autoexit exits whenever the queue drains, which lost the start of replies
+ * and reordered audio around barge-ins. pacat starts within ~120 ms, keeps
+ * strict FIFO order, and killing it on barge-in drops at most a blip.
+ * Any player death is surfaced via 'error' and recovered by respawning on
+ * the next play.
  */
 export class AudioPlayer extends EventEmitter {
   constructor() {
@@ -146,24 +154,36 @@ export class AudioPlayer extends EventEmitter {
   }
 
   _spawn() {
-    const proc = spawn('ffplay', [
-      '-hide_banner', '-loglevel', 'error',
-      '-nodisp', '-autoexit',
-      '-fflags', 'nobuffer', '-flags', 'low_delay',
-      '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ch_layout', 'mono',
-      '-i', 'pipe:0',
-    ])
+    const isDarwin = process.platform === 'darwin'
+    const cmd = isDarwin ? 'ffplay' : 'pacat'
+    const args = isDarwin
+      ? [
+          '-hide_banner', '-loglevel', 'error',
+          '-nodisp', '-autoexit',
+          '-fflags', 'nobuffer', '-flags', 'low_delay',
+          '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ch_layout', 'mono',
+          '-i', 'pipe:0',
+        ]
+      : [
+          '--raw',
+          '--format=s16le',
+          `--rate=${SAMPLE_RATE}`,
+          '--channels=1',
+          '--latency-msec=120',
+          '--client-name=herdr-voice',
+        ]
+    const proc = spawn(cmd, args)
     let err = ''
     proc.stderr.on('data', (d) => (err += d.toString()))
     proc.on('error', (e) => {
       this.failed = true
-      this.emit('error', new Error(`ffplay unavailable: ${e.message}`))
+      this.emit('error', new Error(`${cmd} unavailable: ${e.message}`))
     })
     proc.on('close', (code) => {
       if (this.proc === proc) this.proc = null
       if (code !== 0 && code !== null && !this.failed) {
         this.failed = true
-        this.emit('error', new Error(`ffplay exited ${code}: ${err.slice(0, 160)}`))
+        this.emit('error', new Error(`${cmd} exited ${code}: ${err.slice(0, 160)}`))
       }
     })
     proc.stdin.on('error', () => {})
