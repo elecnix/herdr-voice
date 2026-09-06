@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { RealtimeSession } from './realtime.js'
 import { MicCapture, AudioPlayer } from './audio.js'
 import { createExecutor, readState } from './tools.js'
@@ -112,6 +113,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   let agentAudioTail = 0
   let bargeWindow = false // gate lifted: user is talking over the agent
   let bargeRun = 0 // consecutive chunks above the speech threshold
+  let echoPeak = 0 // recent peak of AI-voice leakage at the mic (envelope)
   const gateTimer = setInterval(
     () => mic?.setGate(fullDuplex ? false : !bargeWindow && Date.now() < agentAudioTail),
     200
@@ -172,6 +174,50 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   // ---- mic ----
   let mic = null
   if (wantMic && mode === 'voice') {
+    // Pre-flight: the configured PulseAudio source must exist. When the
+    // echo-cancel module dies, libpulse SILENTLY falls back to the default
+    // source — barge-in then dies with no error anywhere. Verify, self-heal
+    // once, and if it still fails: refuse the mic loudly (text mode works).
+    const configured = process.env.HERDR_VOICE_MIC_SOURCE ?? process.env.PULSE_SOURCE
+    if (configured && !configured.startsWith('file:') && process.platform !== 'darwin') {
+      const sourceExists = () => {
+        try {
+          const out = execFileSync('pactl', ['list', 'short', 'sources'], {
+            encoding: 'utf8',
+            env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+          })
+          return out.split('\n').some((l) => l.trim() && l.split('\t')[1] === configured)
+        } catch {
+          return true // can't verify (no pactl) — assume fine rather than block
+        }
+      }
+      if (!sourceExists()) {
+        try {
+          execFileSync(
+            'pactl',
+            [
+              'load-module',
+              'module-echo-cancel',
+              'aec_method=webrtc',
+              `source_name=${configured}`,
+              'sink_name=echocancel_sink',
+            ],
+            { stdio: 'pipe' }
+          )
+        } catch {}
+      }
+      if (!sourceExists()) {
+        ui.setMic({ available: false })
+        ui.addSystem(
+          `MIC SOURCE "${configured}" DOES NOT EXIST — the echo-cancel module is gone and ` +
+            `libpulse would silently fall back to a device nobody calibrated (barge-in dead, ` +
+            `AI hears itself). Restore it, e.g.: pactl load-module module-echo-cancel ` +
+            `aec_method=webrtc source_name=echocancel_src sink_name=echocancel_sink ` +
+            `source_master=<real mic> sink_master=<real sink>. Text input still works.`
+        )
+        ui.notify('mic source missing — see pane log')
+      }
+    }
     const devices = await MicCapture.listDevices()
     const picked = MicCapture.pickDevice(devices)
     if (!picked && !micDevice) {
@@ -197,7 +243,18 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
         if (fullDuplex || mic?.muted || (!gated && !session.responseActive) || bargeLevel === 0) {
           bargeRun = 0
         } else {
-          const thr = bargeLevel
+          // Track the AI-voice leak envelope while gated: if the echo
+          // canceller degrades or dies, the AI's own voice raises the floor
+          // and a fixed threshold would fire on every response. SLOW attack
+          // (the continuous leak pulls the envelope up over ~1.3s) + fast
+          // decay: a brief speech burst stays far below the envelope-derived
+          // threshold, so the barge still fires immediately.
+          if (Date.now() < agentAudioTail) {
+            echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.08 : echoPeak * 0.97
+          } else {
+            echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.02 : echoPeak * 0.9
+          }
+          const thr = Math.max(bargeLevel, echoPeak * 1.4)
           bargeRun = l >= thr ? bargeRun + 1 : 0
           if (l >= thr || bargeRun > 0) {
             try {

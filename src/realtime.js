@@ -44,11 +44,8 @@ export class RealtimeSession extends EventEmitter {
       // Proactive rotation: re-open a fresh session before the 60-minute cap.
       clearTimeout(this.rotationTimer)
       this.rotationTimer = setTimeout(() => {
-        this.intentionalClose = true
-        try { this.ws?.close() } catch {}
-        this.intentionalClose = false
         this.reconnect()
-      }, 55 * 60 * 1000)
+      }, Number(process.env.HERDR_VOICE_ROTATE_MS ?? 55 * 60 * 1000))
       this.rotationTimer.unref?.()
     })
     ws.on('message', (raw) => {
@@ -61,7 +58,14 @@ export class RealtimeSession extends EventEmitter {
       this._handle(ev)
     })
     ws.on('error', (err) => this.emit('status', { state: 'error', message: err.message }))
+    const sock = ws
     ws.on('close', (code) => {
+      // Superseded socket (reconnect already opened a replacement): its close
+      // event must NOT schedule anything. Without this guard every rotation
+      // and every reconnect scheduled a SECOND reconnect from the old
+      // socket's async close event, which then closed the LIVE session —
+      // an endless reconnect cascade (one new session every ~2s, forever).
+      if (this.ws !== sock) return
       this.ready = false
       clearTimeout(this.rotationTimer)
       this.emit('status', { state: 'closed', code })
@@ -84,7 +88,12 @@ export class RealtimeSession extends EventEmitter {
    *  proactive rotation before the cap. Conversation context resets; herdr
    *  state is re-read live by the tools, so nothing else is lost. */
   reconnect() {
-    try { this.ws?.close() } catch { /* already gone */ }
+    const old = this.ws
+    this.ws = null // detach first: the old socket's close event must not reschedule
+    try { old?.close() } catch { /* already gone */ }
+    setTimeout(() => {
+      try { old?.terminate() } catch { /* already gone */ }
+    }, 1000).unref?.()
     this.responseActive = false
     this.pendingResponse = false
     this.assistantBuffer = ''

@@ -164,8 +164,17 @@ npm run test:component
 The barge-in component test asserts the full loop: speech crossing the
 threshold cancels the running response within ~300ms, stale audio from the
 cancelled response stays suppressed, and the answer plays once the user stops.
-The same hooks (fake mic / captured speakers) enable a cost-capped end-to-end
-run against the real API (`.github/workflows/e2e-voice.yml`, manual dispatch).
+Two more component tests cover reconnection (exactly one reconnect after an
+unexpected drop) and session rotation (one clean replacement per rotation —
+no cascade). The same hooks (fake mic / captured speakers) enable a
+cost-capped end-to-end run against the real API
+(`.github/workflows/e2e-voice.yml`, manual dispatch).
+
+On a machine with real audio, `npm run test:live` additionally verifies the
+actual audio chain: the configured mic source exists (no silent libpulse
+fallback when the echo-cancel module dies), a bypass signal played to the
+master sink reaches the mic (acoustic path alive), and playback through the
+canceller's sink arrives strongly attenuated (the AI does not hear itself).
 
 ## Microphone
 
@@ -207,8 +216,14 @@ sudo apt install ffmpeg pipewire-audio
 
   ```bash
   pactl load-module module-echo-cancel aec_method=webrtc \
-    source_name=echocancel_src sink_name=echocancel_sink
+    source_name=echocancel_src sink_name=echocancel_sink \
+    source_master=<real mic source> sink_master=<real sink>
   ```
+
+  Always set BOTH masters: without them the module captures the default
+  source (which may be a device that hears nothing — barge-in then dies
+  silently, and without cancellation the AI hears itself). Ubuntu noble
+  ships only the webrtc/null AEC plugins (no speex).
 
   Then run the docked pane with `PULSE_SOURCE=echocancel_src
   PULSE_SINK=echocancel_sink` in its environment (e.g. in a wrapper command).
@@ -224,6 +239,7 @@ sudo apt install ffmpeg pipewire-audio
 | `HERDR_VOICE_SPEAKER_CAPTURE` | unset | Test/CI hook: tee every played audio byte to this file so playback timing can be analyzed |
 | `HERDR_VOICE_PLAYER_CMD` | `pacat` | Test/CI hook: stand-in player command when no sound server exists (e.g. `cat`) |
 | `HERDR_VOICE_WS_URL` | OpenAI | Test/CI hook: Realtime WebSocket endpoint (scripted stub server in component tests) |
+| `HERDR_VOICE_ROTATE_MS` | `3300000` | Session rotation interval (55 min; OpenAI caps sessions at 60) |
 | `HERDR_VOICE_BARGE_MS` | `300` | How long the mic must stay above the barge-in level before the agent pauses for you |
 | `HERDR_VOICE_SOCKET` / `--socket` | auto | Drive a specific herdr session socket |
 | `HERDR_VOICE_CTL` | `~/.cache/herdr-voice/ctl.sock` | Control socket for the split engine/HUD topology |
