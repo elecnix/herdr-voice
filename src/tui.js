@@ -103,6 +103,7 @@ export class VoiceTUI extends EventEmitter {
   _key(k) {
     if (k === '' || k === '') return this.emit('quit') // ctrl-c/d
     if (k === '\t') return this.emit('toggle-mute')
+    if (k === 'b') return this.emit('barge')
     if (k === '\r' || k === '\n') {
       const text = this.input.trim()
       this.input = ''
@@ -291,7 +292,7 @@ export class VoiceTUI extends EventEmitter {
         ? `${C.faint}muted${C.off}`
         : `${C.ok}live${C.off}`
     const spk = this.speaking ? `${C.accent}◉ hearing you${C.off}` : ''
-    const keys = `${C.faint}[tab] mute  [enter] send  [ctrl-c] quit${C.off}`
+    const keys = `${C.faint}[tab] mute  [b] barge-in  [enter] send  [ctrl-c] quit${C.off}`
     out.push(
       `${C.faint}│${C.off} ${pad(`${C.dim}mic${C.off} ${micTag} ${meter} ${spk}`, W - 5 - strip(keys).length)} ${keys} ${C.faint}│${C.off}`
     )

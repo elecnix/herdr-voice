@@ -97,6 +97,11 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     if (soundOn) player.play(b64)
   })
   session.on('interrupt', () => player.flush())
+  session.on('barge', () => {
+    player.flush()
+    session.cancelResponse()
+    ui.setSpeaking(false)
+  })
 
   session.on('tool_call', async ({ name, callId, args }) => {
     ui.addToolCall({ callId, name, args })
