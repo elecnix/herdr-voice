@@ -110,8 +110,8 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   // with HERDR_VOICE_BARGE_LEVEL; 0 disables client-side barge-in.
   const bargeLevel = Number.isFinite(Number(process.env.HERDR_VOICE_BARGE_LEVEL))
     ? Number(process.env.HERDR_VOICE_BARGE_LEVEL)
-    : 0.008
-  const bargeMs = Number(process.env.HERDR_VOICE_BARGE_MS ?? 300)
+    : 0.01
+  const bargeMs = Number(process.env.HERDR_VOICE_BARGE_MS ?? 400)
   let agentAudioTail = 0
   let bargeWindow = false // gate lifted: user is talking over the agent
   let bargeRun = 0 // consecutive chunks above the speech threshold
@@ -125,8 +125,10 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     suppressAudio = false
     bargeWindow = false
     bargeRun = 0
-    playbackStart = 0
-    queuedAudioSec = 0
+    // NOTE: playbackStart/queuedAudioSec are deliberately NOT reset here —
+    // the previous response's audio may still be buffered in the speaker
+    // when the next response begins (tool-call chains). The schedule is
+    // monotonic and only a flush (barge-in/stop) rewinds it.
   })
 
   // After any barge-in, the cancelled response's remaining audio keeps
@@ -161,8 +163,13 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
       const secs = b64.length * 0.75 / 2 / SAMPLE_RATE // base64 -> bytes -> int16 samples -> seconds
       if (!playbackStart) playbackStart = Date.now()
       queuedAudioSec += secs
-      agentAudioTail = playbackStart + queuedAudioSec * 1000 + 500
-      dbg(`${new Date().toISOString()} PLAY +${secs.toFixed(2)}s\n`)
+      // MONOTONIC: a new response starting while the previous one is still
+      // playing must never pull the gate open early (tool calls chain
+      // responses; the old audio is still in the speaker). The schedule may
+      // only extend.
+      const newTail = playbackStart + queuedAudioSec * 1000 + 500
+      if (newTail > agentAudioTail) agentAudioTail = newTail
+      dbg(`${new Date().toISOString()} PLAY +${secs.toFixed(2)}s tail=${Math.round(agentAudioTail - Date.now())}ms\n`)
     } else {
       playbackStart = 0
       queuedAudioSec = 0
@@ -271,21 +278,18 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
         const gated = Date.now() < agentAudioTail
         // Muted means the user silenced the mic on purpose — never barge in
         // on their behalf.
+        // The envelope tracks AMBIENT + leak CONTINUOUSLY (slow attack, slow
+        // decay, both while gated and between turns): room noise like typing
+        // measured 0.011 at this mic — ABOVE the fixed threshold — and a
+        // fixed floor cannot separate it from speech. The envelope rises
+        // through sustained noise (typing, leak, TV) in ~2s and decays
+        // through silence; a genuine speech burst crosses the derived
+        // threshold within its first 300ms because the envelope lags it.
+        echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.12 : echoPeak * 0.96
         if (fullDuplex || mic?.muted || (!gated && !session.responseActive) || bargeLevel === 0) {
           bargeRun = 0
         } else {
-          // Track the AI-voice leak envelope while gated: if the echo
-          // canceller degrades or dies, the AI's own voice raises the floor
-          // and a fixed threshold would fire on every response. SLOW attack
-          // (the continuous leak pulls the envelope up over ~1.3s) + fast
-          // decay: a brief speech burst stays far below the envelope-derived
-          // threshold, so the barge still fires immediately.
-          if (Date.now() < agentAudioTail) {
-            echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.08 : echoPeak * 0.97
-          } else {
-            echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.02 : echoPeak * 0.9
-          }
-          const thr = Math.max(bargeLevel, echoPeak * 1.4)
+          const thr = Math.max(bargeLevel, echoPeak * 1.8)
           bargeRun = l >= thr ? bargeRun + 1 : 0
           if (l >= thr || bargeRun > 0) {
             dbg(`${new Date().toISOString()} BARGE lvl=${l.toFixed(4)} thr=${thr.toFixed(4)} run=${bargeRun}\n`)
