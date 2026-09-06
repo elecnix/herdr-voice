@@ -282,18 +282,25 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
         const gated = Date.now() < agentAudioTail
         // Muted means the user silenced the mic on purpose — never barge in
         // on their behalf.
-        // The envelope tracks AMBIENT + leak CONTINUOUSLY (slow attack, slow
-        // decay, both while gated and between turns): room noise like typing
-        // measured 0.011 at this mic — ABOVE the fixed threshold — and a
-        // fixed floor cannot separate it from speech. The envelope rises
-        // through sustained noise (typing, leak, TV) in ~2s and decays
-        // through silence; a genuine speech burst crosses the derived
-        // threshold within its first 300ms because the envelope lags it.
-        echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.12 : echoPeak * 0.96
+        // State-dependent envelope dynamics. The envelope exists to ride
+        // above CONTINUOUS noise (the AI's playback leak while gated, typing
+        // between turns) — it must NOT chase the user's own barge speech,
+        // which is also sustained: a fast attack pulls the threshold up
+        // behind their voice and the barge never confirms (measured:
+        // lvl 0.0172 vs thr 0.0161, run stuck at 3).
+        if (gated) {
+          // AI playing: the continuous signal is the playback leak (minutes).
+          echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.02 : echoPeak * 0.99
+        } else {
+          // Idle: the continuous signal is typing/room noise. Faster attack,
+          // fast decay — when the user stops typing to speak, the envelope
+          // falls back to ambient within ~0.5s.
+          echoPeak = l > echoPeak ? echoPeak + (l - echoPeak) * 0.1 : echoPeak * 0.9
+        }
         if (fullDuplex || mic?.muted || (!gated && !session.responseActive) || bargeLevel === 0) {
           bargeRun = 0
         } else {
-          const thr = Math.max(bargeLevel, echoPeak * 1.8)
+          const thr = Math.max(bargeLevel, echoPeak * 1.6)
           bargeRun = l >= thr ? bargeRun + 1 : 0
           if (l >= thr || bargeRun > 0) {
             dbg(`${new Date().toISOString()} BARGE lvl=${l.toFixed(4)} thr=${thr.toFixed(4)} run=${bargeRun}\n`)

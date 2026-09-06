@@ -30,6 +30,7 @@ export class RealtimeSession extends EventEmitter {
     this.pendingResponse = false
     this.handledCallIds = new Set()
     this.reconnectAttempts = 0
+    this.cancelledItemIds = new Set()
     this.assistantBuffer = ''
   }
 
@@ -298,6 +299,13 @@ export class RealtimeSession extends EventEmitter {
       case 'response.output_text.done':
       case 'response.output_audio_transcript.done':
       case 'response.audio_transcript.done': {
+        // A cancelled response's partial transcript must not land in the
+        // transcript as if the assistant had said it (seen as stray
+        // fragments like "Got it," preceding the next user turn).
+        if (this.cancelledItemIds?.has(ev.item_id)) {
+          this.assistantBuffer = ''
+          break
+        }
         const final = ev.text ?? ev.transcript ?? this.assistantBuffer
         this.assistantBuffer = ''
         this.emit('assistant_done', { text: final })
@@ -322,6 +330,10 @@ export class RealtimeSession extends EventEmitter {
       case 'response.done': {
         for (const item of ev.response?.output ?? []) {
           if (item.type === 'function_call') this._dispatchCall(item.name, item.call_id, item.arguments)
+          if (item.type === 'message' && item.status && item.status !== 'completed') {
+            this.cancelledItemIds ??= new Set()
+            this.cancelledItemIds.add(item.id)
+          }
         }
         this._releaseResponse()
         if (ev.response?.status === 'completed') this.emit('response_done')
