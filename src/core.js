@@ -89,6 +89,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     agentAudioTail = Date.now() + 800
     if (soundOn) player.play(b64)
   })
+  session.on('interrupt', () => player.flush())
 
   session.on('tool_call', async ({ name, callId, args }) => {
     ui.addToolCall({ callId, name, args })

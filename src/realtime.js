@@ -28,6 +28,11 @@ export class RealtimeSession extends EventEmitter {
     this.pendingResponse = false
     this.handledCallIds = new Set()
     this.assistantBuffer = ''
+    // Voice barge-in state: which user item is currently committed (its
+    // transcription deltas arrive late and must not look like new speech),
+    // and whether the in-flight response was already interrupted once.
+    this.currentUserItemId = null
+    this.interruptedForResponse = false
   }
 
   connect() {
@@ -71,7 +76,7 @@ export class RealtimeSession extends EventEmitter {
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: SAMPLE_RATE },
-            turn_detection: { type: 'semantic_vad' },
+            turn_detection: { type: 'semantic_vad', eagerness: 'low' },
             transcription: { model: 'gpt-4o-transcribe', language: 'en' },
           },
           ...(speaks ? { output: { format: { type: 'audio/pcm', rate: SAMPLE_RATE }, voice: VOICE } } : {}),
@@ -145,7 +150,19 @@ export class RealtimeSession extends EventEmitter {
         }
         break
 
+      case 'input_audio_buffer.committed':
+        // Remember which user item was committed: its transcription deltas
+        // arrive asynchronously DURING the response (transcription lags the
+        // VAD commit), and must never be mistaken for fresh user speech.
+        this.currentUserItemId = ev.item_id ?? ev.item?.id ?? this.currentUserItemId
+        break
+
       case 'input_audio_buffer.speech_started':
+        // NOTE: never cancel/flush on raw speech_started. Semantic VAD commits
+        // turns proactively (sometimes before the user fully stops talking),
+        // and killing playback here discarded the buffered first words of the
+        // response. Real barge-in is detected later, via live dictation text
+        // belonging to a different item than the one being answered.
         this.emit('speech', { active: true })
         break
       case 'input_audio_buffer.speech_stopped':
@@ -159,6 +176,21 @@ export class RealtimeSession extends EventEmitter {
         const acc = (this._partials.get(id) ?? '') + (ev.delta ?? '')
         this._partials.set(id, acc)
         this.emit('user_partial', { itemId: id, text: acc })
+        // Voice barge-in WITH evidence: only interrupt a running response when
+        // dictation from a DIFFERENT item than the one being answered has
+        // transcribed actual words. The committed turn's own transcription
+        // arrives late (during the response) and is skipped via item id;
+        // noise, breath, and leakage never reach three characters.
+        if (
+          this.responseActive &&
+          !this.interruptedForResponse &&
+          id !== this.currentUserItemId &&
+          (acc ?? '').trim().length >= 3
+        ) {
+          this.interruptedForResponse = true
+          this._send({ type: 'response.cancel' })
+          this.emit('interrupt')
+        }
         break
       }
 
@@ -203,6 +235,7 @@ export class RealtimeSession extends EventEmitter {
 
       case 'response.created':
         this.responseActive = true
+        this.interruptedForResponse = false
         break
 
       case 'response.done': {
