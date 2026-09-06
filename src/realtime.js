@@ -1,3 +1,5 @@
+import fs from 'node:fs'
+let dbgAudio = 0
 import WebSocket from 'ws'
 import { EventEmitter } from 'node:events'
 import { MODEL, VOICE, SAMPLE_RATE } from './config.js'
@@ -28,11 +30,6 @@ export class RealtimeSession extends EventEmitter {
     this.pendingResponse = false
     this.handledCallIds = new Set()
     this.assistantBuffer = ''
-    // Voice barge-in state: which user item is currently committed (its
-    // transcription deltas arrive late and must not look like new speech),
-    // and whether the in-flight response was already interrupted once.
-    this.currentUserItemId = null
-    this.interruptedForResponse = false
   }
 
   connect() {
@@ -44,14 +41,11 @@ export class RealtimeSession extends EventEmitter {
 
     ws.on('open', () => {
       this._configure()
-      // Proactive rotation: OpenAI hard-caps Realtime sessions at 60 minutes.
-      // Re-open a fresh session before the cap so long-running voice sessions
-      // never hit it. Conversation context resets; herdr state is re-read
-      // live by the tools, so nothing else is lost.
+      // Proactive rotation: re-open a fresh session before the 60-minute cap.
       clearTimeout(this.rotationTimer)
       this.rotationTimer = setTimeout(() => {
         this.intentionalClose = true
-        try { this.ws?.close() } catch { /* already gone */ }
+        try { this.ws?.close() } catch {}
         this.intentionalClose = false
         this.reconnect()
       }, 55 * 60 * 1000)
@@ -71,9 +65,8 @@ export class RealtimeSession extends EventEmitter {
       this.ready = false
       clearTimeout(this.rotationTimer)
       this.emit('status', { state: 'closed', code })
-      // Auto-reconnect unless the session was closed on purpose (user stop or
-      // proactive rotation). Without this, a network blip or the 60-minute
-      // server-side cap silently ends the voice session for good.
+      // Auto-reconnect unless the user closed the session. OpenAI hard-caps
+      // Realtime sessions at 60 minutes — without this, the agent dies hourly.
       if (!this.intentionalClose) this._scheduleReconnect()
     })
     return this
@@ -87,7 +80,9 @@ export class RealtimeSession extends EventEmitter {
     }, 2000)
   }
 
-  /** Tear down and re-open the Realtime session with fresh state. */
+  /** Fresh session (new 60-minute window). Used for auto-reconnect and
+   *  proactive rotation before the cap. Conversation context resets; herdr
+   *  state is re-read live by the tools, so nothing else is lost. */
   reconnect() {
     try { this.ws?.close() } catch { /* already gone */ }
     this.responseActive = false
@@ -100,6 +95,7 @@ export class RealtimeSession extends EventEmitter {
   }
 
   _send(obj) {
+    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} SEND ${obj.type}\n`) } catch {}
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj))
   }
 
@@ -115,7 +111,7 @@ export class RealtimeSession extends EventEmitter {
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: SAMPLE_RATE },
-            turn_detection: { type: 'semantic_vad', eagerness: 'low' },
+            turn_detection: { type: 'semantic_vad', eagerness: 'medium' },
             transcription: { model: 'gpt-4o-transcribe', language: 'en' },
           },
           ...(speaks ? { output: { format: { type: 'audio/pcm', rate: SAMPLE_RATE }, voice: VOICE } } : {}),
@@ -181,6 +177,15 @@ export class RealtimeSession extends EventEmitter {
   }
 
   _handle(ev) {
+    try {
+      let extra = ''
+      if (ev.error) extra = ' ' + JSON.stringify(ev.error).slice(0, 200)
+      if (ev.type === 'response.done') extra = ` status=${ev.response?.status} out_audio_tokens=${ev.response?.usage?.output_token_details?.audio_tokens ?? '?'}`
+      if (ev.type === 'response.output_audio.delta') dbgAudio++
+      if (ev.type === 'response.created') dbgAudio = 0
+      if (ev.type === 'response.output_audio.done' || ev.type === 'response.done') extra += ` audioDeltas=${dbgAudio}`
+      fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} RECV ${ev.type}${extra}\n`)
+    } catch {}
     switch (ev.type) {
       case 'session.updated':
         if (!this.ready) {
@@ -191,8 +196,8 @@ export class RealtimeSession extends EventEmitter {
 
       case 'input_audio_buffer.committed':
         // Remember which user item was committed: its transcription deltas
-        // arrive asynchronously DURING the response (transcription lags the
-        // VAD commit), and must never be mistaken for fresh user speech.
+        // arrive asynchronously DURING the response, and must never be
+        // mistaken for fresh user speech (barge-in).
         this.currentUserItemId = ev.item_id ?? ev.item?.id ?? this.currentUserItemId
         break
 
@@ -200,8 +205,7 @@ export class RealtimeSession extends EventEmitter {
         // NOTE: never cancel/flush on raw speech_started. Semantic VAD commits
         // turns proactively (sometimes before the user fully stops talking),
         // and killing playback here discarded the buffered first words of the
-        // response. Real barge-in is detected later, via live dictation text
-        // belonging to a different item than the one being answered.
+        // response. Real barge-in is detected later, via live dictation text.
         this.emit('speech', { active: true })
         break
       case 'input_audio_buffer.speech_stopped':
@@ -215,11 +219,15 @@ export class RealtimeSession extends EventEmitter {
         const acc = (this._partials.get(id) ?? '') + (ev.delta ?? '')
         this._partials.set(id, acc)
         this.emit('user_partial', { itemId: id, text: acc })
+        // Voice barge-in WITH evidence: only interrupt a running response once
+        // the dictation has actually transcribed words. Noise, breath, and
+        // trailing mouth-sounds never reach three characters, so responses can
+        // no longer be killed by a stray VAD event.
         // Voice barge-in WITH evidence: only interrupt a running response when
-        // dictation from a DIFFERENT item than the one being answered has
-        // transcribed actual words. The committed turn's own transcription
-        // arrives late (during the response) and is skipped via item id;
-        // noise, breath, and leakage never reach three characters.
+        // dictation from a DIFFERENT item than the one being answered
+        // transcribes actual words. The committed turn's own transcription
+        // deltas arrive late (during the response) and are skipped; noise and
+        // leakage never reach three characters.
         if (
           this.responseActive &&
           !this.interruptedForResponse &&
@@ -275,6 +283,7 @@ export class RealtimeSession extends EventEmitter {
       case 'response.created':
         this.responseActive = true
         this.interruptedForResponse = false
+        this.emit('response_created')
         break
 
       case 'response.done': {
@@ -296,9 +305,6 @@ export class RealtimeSession extends EventEmitter {
   }
 
   close() {
-    this.intentionalClose = true
-    clearTimeout(this.rotationTimer)
-    clearTimeout(this.reconnectTimer)
     this.ws?.close()
   }
 

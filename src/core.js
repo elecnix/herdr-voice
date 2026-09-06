@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import { RealtimeSession } from './realtime.js'
 import { MicCapture, AudioPlayer } from './audio.js'
 import { createExecutor, readState } from './tools.js'
@@ -14,7 +15,7 @@ import { TranscriptStore, copyToClipboard } from './transcript.js'
  * setHerdrState. Returns handles the host wires to its input events.
  */
 export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = true, micDevice }) {
-  const transcript = new TranscriptStore()
+  const transcript = new TranscriptStore(); console.error('DBG1 transcript')
   const player = new AudioPlayer().start()
   player.on('error', (e) => ui.addSystem(`audio out failed: ${e.message}`))
   let soundOn = true
@@ -86,14 +87,37 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     ui.updateAssistant(text, true)
     if (text) transcript.assistant(text)
   })
-  // Echo gate: while agent audio is streaming (plus a short tail) the mic
-  // sends silence, so the agent's own voice leaking through speakers cannot
-  // trigger server-side VAD and truncate its response. Declared here because
-  // the audio handler refreshes the tail on every streamed chunk.
+  // Echo gate + client-side barge-in. While agent audio is streaming (plus a
+  // short tail) the mic sends silence, so speaker leakage cannot trigger
+  // server-side VAD. But that gate also deafens the server to real barge-in,
+  // so we watch the RAW mic level here (it bypasses the gate): sustained
+  // speech lifts the gate, stops the response, and lets the server hear the
+  // user live. The threshold adapts to the room's noise floor; set
+  // HERDR_VOICE_BARGE_LEVEL to force an absolute level, or 0 to disable.
   const fullDuplex = process.env.HERDR_VOICE_FULL_DUPLEX === '1'
+  const bargeLevelOverride = Number(process.env.HERDR_VOICE_BARGE_LEVEL ?? NaN)
+  const bargeMs = Number(process.env.HERDR_VOICE_BARGE_MS ?? 300)
   let agentAudioTail = 0
+  let bargeWindow = false // gate lifted: user is talking over the agent
+  let bargeRun = 0 // consecutive chunks above the speech threshold
+  let noiseFloor = 0.002
+  const bargeThreshold = () =>
+    Number.isFinite(bargeLevelOverride)
+      ? bargeLevelOverride
+      : Math.min(0.5, Math.max(0.004, noiseFloor * 8))
+  const gateTimer = setInterval(
+    () => mic?.setGate(fullDuplex ? false : !bargeWindow && Date.now() < agentAudioTail),
+    200
+  )
+  gateTimer.unref?.()
+  session.on('response_created', () => {
+    bargeWindow = false
+    bargeRun = 0
+  })
+
   session.on('audio', (b64) => {
-    agentAudioTail = Date.now() + 800
+    agentAudioTail = Date.now() + 500
+    try { fs.appendFileSync('/tmp/herdr-voice-ws.log', `${new Date().toISOString()} PLAY +${b64.length}b64chars\n`) } catch {}
     if (soundOn) player.play(b64)
   })
   session.on('interrupt', () => player.flush())
@@ -121,7 +145,7 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     }
   })
 
-  session.connect()
+  console.error('DBG2 before connect'); session.connect(); console.error('DBG3 after connect')
 
   // ---- mic ----
   let mic = null
@@ -136,21 +160,34 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
           : 'no microphone available — grant mic permission (System Settings > Privacy & Security > Microphone). Text input still works.'
       )
     } else {
-      // macOS addresses inputs as avfoundation indices (":0"); Linux uses the
-      // PulseAudio source name, and "default" follows the desktop's selection.
+      // Linux: capture the PulseAudio/PipeWire default source so the desktop's
+      // own input selection is respected, instead of guessing among sources.
       const device = micDevice ?? (process.platform === 'darwin' ? `:${picked.index}` : 'default')
       mic = new MicCapture({ device }).start()
       ui.setMic({ available: true, muted: true })
       ui.addSystem(`mic: ${micDevice ?? picked.name} — unmute to talk`)
       mic.on('chunk', (b64) => session.sendAudio(b64))
-      mic.on('level', (l) => ui.setMic({ level: l }))
-      if (!fullDuplex) {
-        // The gate flips ~200 ms after playback starts and releases shortly
-        // after the last streamed chunk, keeping the server's view of the
-        // user turn clean end to end.
-        const gateTimer = setInterval(() => mic?.setGate(Date.now() < agentAudioTail), 200)
-        gateTimer.unref?.()
-      }
+      mic.on('level', (l) => {
+        // Adaptive noise floor: snaps down to any quieter sample, creeps up
+        // slowly through louder ones — so speech is measured against the
+        // room, not a magic constant.
+        noiseFloor = l < noiseFloor ? l : noiseFloor + (l - noiseFloor) * 0.05
+        ui.setMic({ level: l })
+        const gated = Date.now() < agentAudioTail
+        if (fullDuplex || (!gated && !session.responseActive) || bargeLevelOverride === 0) {
+          bargeRun = 0
+        } else {
+          bargeRun = l >= bargeThreshold() ? bargeRun + 1 : 0
+          if (!bargeWindow && mic && bargeRun * mic.chunkMs >= bargeMs) {
+            bargeWindow = true
+            mic.setGate(false) // server starts hearing the user live
+            player.flush()
+            session.cancelResponse()
+            ui.setSpeaking(false)
+            ui.notify('listening — agent paused')
+          }
+        }
+      })
       mic.on('error', (e) => {
         ui.setMic({ available: false })
         ui.addSystem(`mic error: ${e.message}`)
@@ -188,9 +225,8 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
     },
     submit(text) {
       transcript.user(text, { typed: true })
-      // Typed input preempts a running response: stop generation and drop the
-      // queued playback now, so the new answer starts speaking immediately
-      // instead of being queued behind the remainder of the old one.
+      // Typed input preempts a running response: stop the old answer and its
+      // playback now, so the new answer starts speaking immediately.
       if (session.responseActive) {
         player.flush()
         session.cancelResponse()
