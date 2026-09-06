@@ -23,10 +23,47 @@ export class MicCapture extends EventEmitter {
     // through the speakers and truncate its response. Half-duplex by design;
     // press 'b' in the TUI to barge in manually.
     this.gate = false
+    // Rolling window of RAW (pre-gate) chunks: while the echo gate sends
+    // silence, the user's first words exist only here. On barge-in the
+    // window is drained to the server so transcription starts at the true
+    // beginning of the sentence, not mid-word.
+    this.ring = []
   }
 
   setGate(on) {
     this.gate = on
+  }
+
+  /**
+   * Return (and clear) the recent raw audio, starting at the detected speech
+   * onset: walking backward, the first run of ~600ms with levels below
+   * onsetRms marks the quiet gap before the user began speaking. Everything
+   * after it is their speech (possibly mixed with playback leakage — brief).
+   */
+  drainRecentAudio(onsetRms) {
+    const ring = this.ring
+    this.ring = []
+    const QUIET_RUN = 6
+    let start = 0
+    for (let i = ring.length - 1; i >= QUIET_RUN; i--) {
+      let quiet = true
+      for (let j = i - QUIET_RUN + 1; j <= i; j++) {
+        if (ring[j].rms >= onsetRms) {
+          quiet = false
+          break
+        }
+      }
+      if (quiet) {
+        start = i + 1
+        break
+      }
+    }
+    // nothing loud found at all (or the whole window is loud): send at most
+    // the last second — a bounded guess beats dropping the words entirely
+    if (start === 0 && ring.length && ring[ring.length - 1].rms >= onsetRms) {
+      start = Math.max(0, ring.length - 10)
+    }
+    return ring.slice(start).map((c) => c.b64)
   }
 
   static async listDevices() {
@@ -121,6 +158,9 @@ export class MicCapture extends EventEmitter {
         const chunk = pending.subarray(0, chunkBytes)
         pending = pending.subarray(chunkBytes)
         const level = rms(chunk)
+        // rolling raw window for the barge-in drain (4s bound)
+        this.ring.push({ b64: chunk.toString('base64'), rms: level })
+        if (this.ring.length > 40) this.ring.shift()
         if (this.muted || this.gate) {
           // Zero-filled chunks keep the stream (and VAD turn state) alive
           // without letting leakage/echo reach the server.

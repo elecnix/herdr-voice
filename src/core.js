@@ -152,6 +152,15 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
   const bargeIn = () => {
     suppressAudio = true
     player.flush()
+    // Feed the server the speech it missed while the gate was closed: the
+    // detection window (400ms + poll granularity) swallowed the user's first
+    // words, which were sent as silence. Drain the raw ring buffer up to the
+    // speech onset so transcription starts at the true beginning. Skipped in
+    // full-duplex (the server hears everything live) and while muted.
+    if (mic && !mic.muted && !fullDuplex) {
+      const onsetRms = Math.max(bargeLevel, echoPeak * 1.2)
+      for (const b64 of mic.drainRecentAudio(onsetRms)) session.sendAudio(b64)
+    }
     session.cancelResponse()
     playbackStart = 0
     queuedAudioSec = 0

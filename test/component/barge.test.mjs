@@ -299,6 +299,8 @@ wss.on('listening', async () => {
       return finish(false, `no suppression stall after cancel (max stall ${stallMax}ms)`)
     if (last < 80_000) return finish(false, `capture only ${last} bytes — responses did not play`)
     if (!seen.response2Started) return finish(false, 'response #2 never started')
+    if (seen.nonSilentChunk === null)
+      return finish(false, 'the server never received REAL mic audio — pre-trigger speech was not drained on barge-in')
     hardTimeout.unref()
     finish(true)
   }, 12_000)
