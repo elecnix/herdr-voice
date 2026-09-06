@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events'
 import { MODEL, VOICE, SAMPLE_RATE } from './config.js'
 import { REALTIME_TOOLS, INSTRUCTIONS } from './tools.js'
 
-const REALTIME_URL = 'wss://api.openai.com/v1/realtime'
+const REALTIME_URL = process.env.HERDR_VOICE_WS_URL ?? 'wss://api.openai.com/v1/realtime'
 
 /**
  * Node-side Realtime session over WebSocket.

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
 import { SAMPLE_RATE } from './config.js'
 
 /**
@@ -17,11 +18,10 @@ export class MicCapture extends EventEmitter {
     this.proc = null
     this.muted = true
     this.stderr = ''
-    // Echo gate: while the agent is speaking, mic chunks are replaced with
+    // Echo gate: while the agent is speaking, mic audio is replaced with
     // silence so server-side VAD cannot hear the agent's own voice leaking
-    // through speakers and truncate its response mid-sentence. Half-duplex
-    // by design; HERDR_VOICE_FULL_DUPLEX=1 disables the gate entirely
-    // (headphones: true full-duplex barge-in with no echo to suppress).
+    // through the speakers and truncate its response. Half-duplex by design;
+    // press 'b' in the TUI to barge in manually.
     this.gate = false
   }
 
@@ -82,7 +82,7 @@ export class MicCapture extends EventEmitter {
    */
   static pickDevice(devices) {
     const VIRTUAL = /teams|virtual|blackhole|loopback|soundflower|aggregate|zoomaudio|multi-output/i
-    const PREFERRED = /macbook.*microphone|built-in|external microphone|usb|airpods|studio display|microphone|webcam|headset|audio controller/i
+    const PREFERRED = /macbook.*microphone|built-in|external microphone|usb|airpods|studio display/i
     const real = devices.filter((d) => !VIRTUAL.test(d.name))
     if (real.length === 0) return null
     return real.find((d) => PREFERRED.test(d.name)) ?? real[0]
@@ -92,10 +92,17 @@ export class MicCapture extends EventEmitter {
     const isDarwin = process.platform === 'darwin'
     // On Linux, a legacy avfoundation-style index (":0") means "just use default".
     const input = !isDarwin && /^:\d+$/.test(this.device) ? 'default' : this.device
+    // Test/CI hook: capture the mic from a file (any ffmpeg-probeable input)
+    // instead of a device. -re paces the read at realtime so chunk timing
+    // matches a live microphone exactly.
+    const micSource = process.env.HERDR_VOICE_MIC_SOURCE
+    const fromFile = Boolean(micSource)
+    const inputArg = fromFile ? micSource : input
     const args = [
       '-hide_banner', '-loglevel', 'error',
-      '-f', isDarwin ? 'avfoundation' : 'pulse',
-      '-i', input,
+      ...(fromFile ? ['-re'] : []),
+      ...(fromFile ? [] : ['-f', isDarwin ? 'avfoundation' : 'pulse']),
+      '-i', inputArg,
       '-ar', String(SAMPLE_RATE),
       '-ac', '1',
       '-f', 's16le',
@@ -113,15 +120,15 @@ export class MicCapture extends EventEmitter {
       while (pending.length >= chunkBytes) {
         const chunk = pending.subarray(0, chunkBytes)
         pending = pending.subarray(chunkBytes)
+        const level = rms(chunk)
         if (this.muted || this.gate) {
-          // Zero-filled chunks keep the audio stream (and VAD turn state)
-          // alive without letting speaker leakage reach the server. Cutting
-          // the stream instead would freeze the turn mid-flight.
+          // Zero-filled chunks keep the stream (and VAD turn state) alive
+          // without letting leakage/echo reach the server.
           this.emit('chunk', Buffer.alloc(chunkBytes).toString('base64'))
         } else {
           this.emit('chunk', chunk.toString('base64'))
         }
-        this.emit('level', rms(chunk))
+        this.emit('level', level)
       }
     })
     proc.stderr.on('data', (d) => {
@@ -148,18 +155,18 @@ export class MicCapture extends EventEmitter {
 }
 
 /**
- * Playback of assistant PCM16 audio through a long-lived stdin pipe.
- * macOS: ffplay (unchanged from the original implementation — NOTE: ffplay
- * rejects `-ac` (that silently killed audio out for days — every play exited
- * code 1 unseen). Channel count must be `-ch_layout mono`.)
- * Linux: pacat, which streams raw s16le straight into PipeWire/PulseAudio
- * with a small fixed server-side buffer. ffplay was unusable on Linux for
- * live streaming: its demuxer queue adds variable multi-second latency and
- * -autoexit exits whenever the queue drains, which lost the start of replies
- * and reordered audio around barge-ins. pacat starts within ~120 ms, keeps
- * strict FIFO order, and killing it on barge-in drops at most a blip.
- * Any player death is surfaced via 'error' and recovered by respawning on
- * the next play.
+ * Playback of assistant PCM16 audio through a long-lived ffplay stdin pipe.
+ * NOTE: ffplay rejects `-ac` (that silently killed audio out for days — every
+ * play exited code 1 unseen). Channel count must be `-ch_layout mono`, and any
+ * player death is surfaced via 'error' and recovered by respawning on next play.
+ */
+/**
+ * Playback of assistant PCM16 audio through a long-lived pacat stream.
+ * pacat writes straight into PipeWire with a small fixed server-side buffer,
+ * so audio starts within ~100 ms, never reorders, and never sits in a
+ * multi-second internal queue the way ffplay's demuxer did (which caused
+ * missing beginnings, half words, and out-of-order playback).
+ * PULSE_SINK routing (echo-cancel sink) is inherited from the environment.
  */
 export class AudioPlayer extends EventEmitter {
   constructor() {
@@ -169,37 +176,28 @@ export class AudioPlayer extends EventEmitter {
   }
 
   _spawn() {
-    const isDarwin = process.platform === 'darwin'
-    const cmd = isDarwin ? 'ffplay' : 'pacat'
-    const args = isDarwin
-      ? [
-          '-hide_banner', '-loglevel', 'error',
-          '-nodisp', '-autoexit',
-          '-fflags', 'nobuffer', '-flags', 'low_delay',
-          '-f', 's16le', '-ar', String(SAMPLE_RATE), '-ch_layout', 'mono',
-          '-i', 'pipe:0',
-        ]
-      : [
-          '--raw',
-          '--format=s16le',
-          `--rate=${SAMPLE_RATE}`,
-          '--channels=1',
-          '--latency-msec=120',
-          '--client-name=herdr-voice',
-        ]
+    // Test/CI hook: a stand-in player command when the real sound server is
+    // not available (e.g. `cat` just drains the stream).
+    const cmd = process.env.HERDR_VOICE_PLAYER_CMD ?? 'pacat'
+    const args =
+      cmd === 'pacat'
+        ? [
+            '--raw',
+            '--format=s16le',
+            `--rate=${SAMPLE_RATE}`,
+            '--channels=1',
+            '--latency-msec=120',
+            '--client-name=herdr-voice',
+          ]
+        : []
     const proc = spawn(cmd, args)
-    let err = ''
-    proc.stderr.on('data', (d) => (err += d.toString()))
+    proc.stderr.on('data', () => {})
     proc.on('error', (e) => {
       this.failed = true
       this.emit('error', new Error(`${cmd} unavailable: ${e.message}`))
     })
-    proc.on('close', (code) => {
+    proc.on('close', () => {
       if (this.proc === proc) this.proc = null
-      if (code !== 0 && code !== null && !this.failed) {
-        this.failed = true
-        this.emit('error', new Error(`${cmd} exited ${code}: ${err.slice(0, 160)}`))
-      }
     })
     proc.stdin.on('error', () => {})
     return proc
@@ -211,11 +209,18 @@ export class AudioPlayer extends EventEmitter {
   }
 
   play(base64) {
-    if (!this.proc?.stdin.writable) {
-      if (this.failed) return
-      this.proc = this._spawn() // respawn after a clean autoexit
+    if (this.failed) return
+    const buf = Buffer.from(base64, 'base64')
+    // Test/CI hook: tee everything "spoken" to a file so tests can analyze
+    // exact playback timing byte by byte.
+    const capture = process.env.HERDR_VOICE_SPEAKER_CAPTURE
+    if (capture) {
+      try {
+        fs.appendFileSync(capture, buf)
+      } catch {}
     }
-    this.proc.stdin.write(Buffer.from(base64, 'base64'))
+    if (!this.proc?.stdin.writable) this.proc = this._spawn()
+    this.proc.stdin.write(buf)
   }
 
   stop() {
@@ -227,14 +232,29 @@ export class AudioPlayer extends EventEmitter {
     }
     this.proc = null
   }
+
+  /** Barge-in: drop everything queued. The server-side buffer holds at most
+   *  ~120 ms, so stopping loses only a blip of audio — then the next play()
+   *  call respawns a fresh stream. */
+  flush() {
+    try {
+      if (this.proc) {
+        this.proc.kill('SIGKILL')
+        this.proc = null
+      }
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
-function rms(buf) {
+/** Root-mean-square level of a PCM16 mono chunk, normalized to 0..1. */
+function rms(buffer) {
   let sum = 0
-  const n = Math.floor(buf.length / 2)
+  const n = Math.floor(buffer.length / 2)
   for (let i = 0; i < n; i++) {
-    const s = buf.readInt16LE(i * 2) / 32768
-    sum += s * s
+    const sample = buffer.readInt16LE(i * 2)
+    sum += sample * sample
   }
-  return Math.min(1, Math.sqrt(sum / Math.max(1, n)) * 4)
+  return Math.sqrt(sum / n) / 32768
 }

@@ -151,6 +151,22 @@ Verified live against `gpt-realtime-2.1`:
 - Sending `response.create` while a response is active errors with "conversation already
   has an active response in progress" — all response requests go through a gate.
 
+## Testing
+
+Component tests run the real core against a scripted Realtime stub server, a
+file-backed fake microphone, and a byte-captured fake speaker — no audio
+hardware, no API key:
+
+```bash
+npm run test:component
+```
+
+The barge-in component test asserts the full loop: speech crossing the
+threshold cancels the running response within ~300ms, stale audio from the
+cancelled response stays suppressed, and the answer plays once the user stops.
+The same hooks (fake mic / captured speakers) enable a cost-capped end-to-end
+run against the real API (`.github/workflows/e2e-voice.yml`, manual dispatch).
+
 ## Microphone
 
 The app filters **virtual audio devices** (Microsoft Teams Audio, BlackHole, loopback,
@@ -204,6 +220,10 @@ sudo apt install ffmpeg pipewire-audio
 | `HERDR_VOICE_MODEL` | `gpt-realtime-2.1` | Realtime model; `gpt-realtime-2.1-mini` is ~3x cheaper audio with weaker tool orchestration |
 | `HERDR_VOICE_FULL_DUPLEX` | unset | Set to `1` to disable the echo gate (headphones: the mic stays open while the agent speaks, for true full-duplex barge-in) |
 | `HERDR_VOICE_BARGE_LEVEL` | `0.008` | Mic RMS level (on the echo-cancelled stream) that counts as barge-in speech; ambient sits ~0.002-0.005, a speaking voice ~0.011+. `0` disables client-side barge-in. |
+| `HERDR_VOICE_MIC_SOURCE` | device | Test/CI hook: read the mic from any ffmpeg input (e.g. a WAV file, paced at realtime with `-re`) instead of a capture device |
+| `HERDR_VOICE_SPEAKER_CAPTURE` | unset | Test/CI hook: tee every played audio byte to this file so playback timing can be analyzed |
+| `HERDR_VOICE_PLAYER_CMD` | `pacat` | Test/CI hook: stand-in player command when no sound server exists (e.g. `cat`) |
+| `HERDR_VOICE_WS_URL` | OpenAI | Test/CI hook: Realtime WebSocket endpoint (scripted stub server in component tests) |
 | `HERDR_VOICE_BARGE_MS` | `300` | How long the mic must stay above the barge-in level before the agent pauses for you |
 | `HERDR_VOICE_SOCKET` / `--socket` | auto | Drive a specific herdr session socket |
 | `HERDR_VOICE_CTL` | `~/.cache/herdr-voice/ctl.sock` | Control socket for the split engine/HUD topology |

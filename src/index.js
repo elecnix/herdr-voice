@@ -69,6 +69,14 @@ async function main() {
   ui.on('quit', shutdown)
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
+  process.on('SIGHUP', shutdown)
+  // Orphan guard: when the pane's PTY disappears (pane closed, herdr
+  // restarted), stdin closes without any signal. Without this, an engine can
+  // outlive its pane as an invisible zombie — still holding the mic, still
+  // connected to OpenAI, still speaking through its own pacat while the user
+  // barges into the NEW pane's engine. Never let an engine outlive its pane.
+  process.stdin.on('end', shutdown)
+  process.stdin.on('close', shutdown)
 }
 
 main().catch((err) => {

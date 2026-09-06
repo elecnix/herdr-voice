@@ -1,0 +1,26 @@
+# OPTIONAL, cost-capped end-to-end test against the real OpenAI Realtime API.
+# Runs only on manual dispatch with OPENAI_API_KEY configured. Uses the mini
+# model and one short turn (~1 minute of audio) to keep cost around a cent.
+name: e2e-voice
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    if: ${{ github.repository_owner == 'elecnix' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install dependencies
+        run: npm install --omit=dev --no-fund --no-audit
+      - name: End-to-end voice check
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          HERDR_VOICE_MODEL: gpt-realtime-2.1-mini
+        run: node test/e2e.mjs

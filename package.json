@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "test:e2e": "node test/e2e.mjs",
-    "sandbox": "python3 scripts/sandbox.py voicelab"
+    "sandbox": "python3 scripts/sandbox.py voicelab",
+    "test:component": "node test/component/barge.test.mjs"
   },
   "keywords": [],
   "author": "",
