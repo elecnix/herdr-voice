@@ -210,23 +210,17 @@ sudo apt install ffmpeg pipewire-audio
 - **Playback**: `pacat` streams the assistant's PCM straight into the sound
   server with a small fixed buffer (~120 ms), which keeps barge-in latency low
   and playback in order. `--latency-msec` can be tuned if your setup needs it.
-- **Echo cancellation (speakers instead of headphones)**: without it, the
-  agent's own voice leaking into the mic looks like an interruption. Load
-  PipeWire's echo canceller once per boot:
-
-  ```bash
-  pactl load-module module-echo-cancel aec_method=webrtc \
-    source_name=echocancel_src sink_name=echocancel_sink \
-    source_master=<real mic source> sink_master=<real sink>
-  ```
-
-  Always set BOTH masters: without them the module captures the default
-  source (which may be a device that hears nothing — barge-in then dies
-  silently, and without cancellation the AI hears itself). Ubuntu noble
-  ships only the webrtc/null AEC plugins (no speex).
-
-  Then run the docked pane with `PULSE_SOURCE=echocancel_src
-  PULSE_SINK=echocancel_sink` in its environment (e.g. in a wrapper command).
+- **Echo cancellation (speakers instead of headphones) is OPTIONAL.** The
+  plugin by default uses the RAW microphone and does not require a system
+  canceller: the agent's playback is gated to silence server-side (half
+  duplex), and the barge-in threshold adapts above any measured playback
+  leakage. If you want true full-duplex with speakers, you can add PipeWire's
+  canceller — but VERIFY it before relying on it (`npm run test:live`):
+  webrtc's processing on some distros crushes quiet audio even with
+  `noise_suppression=0` (aec_args silently ignored), which kills the mic
+  path while module listings still look healthy. Always set BOTH
+  `source_master`/`sink_master` to the devices your voice and speakers
+  actually use — a mismatch falls back to the default source silently.
 
 ## Environment variables
 
