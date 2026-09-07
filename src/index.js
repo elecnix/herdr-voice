@@ -52,6 +52,8 @@ async function main() {
 
   ui.on('toggle-mic', core.toggleMic)
   ui.on('toggle-mute', core.toggleMic) // full-TUI event name
+  ui.on('barge', () => core.bargeIn())
+  ui.on('stop-audio', () => core.stopAudio())
   ui.on('toggle-sound', core.toggleSound)
   ui.on('toggle-text', () => ui.setText?.(!(ui.textOn ?? true)))
   ui.on('copy', () => core.copy(false))

@@ -1,5 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
 import { SAMPLE_RATE } from './config.js'
 
 const DEVICE_LIST_TIMEOUT_MS = 2000
@@ -52,11 +53,13 @@ export function parsePactlSources(pactl) {
 }
 
 /** ffmpeg arguments for capturing a microphone as PCM16 mono. */
-export function captureArgs({ device, sampleRate = SAMPLE_RATE, platform = process.platform }) {
+export function captureArgs({ device, sampleRate = SAMPLE_RATE, platform = process.platform, fromFile = false }) {
   const isDarwin = platform === 'darwin'
   return [
     '-hide_banner', '-loglevel', 'error',
-    '-f', isDarwin ? 'avfoundation' : 'pulse',
+    // A file is paced at realtime so chunk timing matches a live microphone;
+    // a capture device needs the platform's input format instead.
+    ...(fromFile ? ['-re'] : ['-f', isDarwin ? 'avfoundation' : 'pulse']),
     '-i', device,
     '-ar', String(sampleRate),
     '-ac', '1',
@@ -112,6 +115,50 @@ export class MicCapture extends EventEmitter {
     this.proc = null
     this.muted = true
     this.stderr = ''
+    // Echo gate: while the agent is speaking, mic audio is replaced with
+    // silence so the server's turn detection cannot hear the agent's own voice
+    // coming back through the speakers and treat it as the user interrupting.
+    this.gate = false
+    // Rolling window of RAW (pre-gate) chunks. While the gate is closed the
+    // user's first words exist only here, so on a barge the window is drained
+    // to the server and transcription starts at the true beginning of the
+    // sentence rather than mid-word.
+    this.ring = []
+  }
+
+  setGate(on) {
+    this.gate = on
+  }
+
+  /**
+   * Return (and clear) the recent raw audio, from the speech onset onward:
+   * walking backwards, the first run of about 600ms quieter than `onsetRms` is
+   * the gap before the user started talking.
+   */
+  drainRecentAudio(onsetRms) {
+    const ring = this.ring
+    this.ring = []
+    const QUIET_RUN = 6
+    let start = 0
+    for (let i = ring.length - 1; i >= QUIET_RUN; i--) {
+      let quiet = true
+      for (let j = i - QUIET_RUN + 1; j <= i; j++) {
+        if (ring[j].rms >= onsetRms) {
+          quiet = false
+          break
+        }
+      }
+      if (quiet) {
+        start = i + 1
+        break
+      }
+    }
+    // Nothing quiet found at all: send at most the last second, a bounded guess
+    // being better than dropping the words entirely.
+    if (start === 0 && ring.length && ring[ring.length - 1].rms >= onsetRms) {
+      start = Math.max(0, ring.length - 10)
+    }
+    return ring.slice(start).map((c) => c.b64)
   }
 
   static async listDevices() {
@@ -191,9 +238,17 @@ export class MicCapture extends EventEmitter {
 
   start() {
     const isDarwin = process.platform === 'darwin'
+    // Test hook: read the microphone from any ffmpeg-probeable input (a WAV
+    // file, paced at realtime with -re) instead of a capture device, so the
+    // whole pipeline can be exercised with no hardware.
+    const fromFile = process.env.HERDR_VOICE_MIC_SOURCE
     // On Linux, a legacy avfoundation-style index (":0") means "just use default".
     const input = !isDarwin && /^:\d+$/.test(this.device) ? 'default' : this.device
-    const proc = spawn('ffmpeg', captureArgs({ device: input, platform: process.platform }))
+    const proc = spawn('ffmpeg', captureArgs({
+      device: fromFile || input,
+      platform: process.platform,
+      fromFile: Boolean(fromFile),
+    }))
     this.proc = proc
 
     // bytes per chunk: 2 bytes/sample * rate * ms/1000
@@ -205,10 +260,19 @@ export class MicCapture extends EventEmitter {
       while (pending.length >= chunkBytes) {
         const chunk = pending.subarray(0, chunkBytes)
         pending = pending.subarray(chunkBytes)
-        if (!this.muted) {
+        const level = rms(chunk)
+        this.ring.push({ b64: chunk.toString('base64'), rms: level })
+        if (this.ring.length > 40) this.ring.shift() // ~4s
+        if (this.muted || this.gate) {
+          // Zero-filled chunks keep the stream and the server's turn state
+          // alive without letting the agent's own voice reach it.
+          this.emit('chunk', Buffer.alloc(chunkBytes).toString('base64'))
+        } else {
           this.emit('chunk', chunk.toString('base64'))
-          this.emit('level', rms(chunk))
         }
+        // The level is always the RAW one: it is what barge-in is detected
+        // from, and it has to bypass the gate to be of any use.
+        this.emit('level', level)
       }
     })
     proc.stderr.on('data', (d) => {
@@ -334,6 +398,16 @@ export class AudioPlayer extends EventEmitter {
         this.proc = this._spawn() // respawn after a clean autoexit
       }
       this.proc.stdin.write(chunk)
+      // Test hook: tee everything "spoken" to a file, so a test can analyse the
+      // timing and the level of what actually reached the speaker.
+      const capture = process.env.HERDR_VOICE_SPEAKER_CAPTURE
+      if (capture) {
+        try {
+          fs.appendFileSync(capture, chunk)
+        } catch {
+          /* never let logging break playback */
+        }
+      }
       // Says exactly when this audio reaches the room, for anything that needs
       // to know what the microphone is about to hear.
       this.emit('played', { pcm: chunk, at: this.playHead })
@@ -373,12 +447,21 @@ export class AudioPlayer extends EventEmitter {
   }
 }
 
+/**
+ * True root-mean-square of a PCM16 mono chunk, 0..1.
+ *
+ * This used to return the level already multiplied up for the on-screen meter.
+ * That is fine for drawing a bar and useless for deciding anything: barge-in
+ * compares this against the level the agent's own voice arrives at, and a
+ * quantity scaled for legibility makes every one of those thresholds wrong by
+ * the scaling factor. The meter applies its own scaling where it draws.
+ */
 function rms(buf) {
   let sum = 0
   const n = Math.floor(buf.length / 2)
   for (let i = 0; i < n; i++) {
-    const s = buf.readInt16LE(i * 2) / 32768
+    const s = buf.readInt16LE(i * 2)
     sum += s * s
   }
-  return Math.min(1, Math.sqrt(sum / Math.max(1, n)) * 4)
+  return Math.sqrt(sum / Math.max(1, n)) / 32768
 }
