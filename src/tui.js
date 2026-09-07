@@ -171,6 +171,16 @@ export class VoiceTUI extends EventEmitter {
     } else this.transcript.push({ role: 'you', text, done })
     this.dirty = true
   }
+
+  addOrUpdateUser(itemId, text, done) {
+    const found = this.transcript.find((t) => t.userItemId === itemId)
+    if (found) {
+      found.text = text
+      found.done = done
+    } else this.transcript.push({ role: 'you', text, done, userItemId: itemId })
+    this.dirty = true
+  }
+
   updateAssistant(text, done = false) {
     const last = this.transcript[this.transcript.length - 1]
     if (last && last.role === 'ai' && !last.done) {
