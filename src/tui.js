@@ -101,23 +101,37 @@ export class VoiceTUI extends EventEmitter {
   }
 
   _key(k) {
-    if (k === '' || k === '') return this.emit('quit') // ctrl-c/d
-    if (k === '\t') return this.emit('toggle-mute')
-    if (k === '\r' || k === '\n') {
-      const text = this.input.trim()
-      this.input = ''
-      this.dirty = true
-      if (text) this.emit('submit', text)
-      return
+    // Escape sequences (arrows, function keys) arrive as one multi-character
+    // chunk and are ignored whole; a LONE escape is the stop-audio key.
+    if (k === '\x1b') return this.emit('stop-audio')
+    if (k.startsWith('\x1b')) return
+    // Input can arrive several characters at a time — from a fast typist, or
+    // from send_text delivering a whole line — so it is handled per character.
+    // Handled per chunk, a control key stops working depending on what it
+    // happened to be batched with.
+    for (const ch of k) {
+      if (ch === '\x03' || ch === '\x04') return this.emit('quit') // ctrl-c/d
+      if (ch === '\t') return this.emit('toggle-mute')
+      // Single-letter shortcuts apply only while nothing is being typed.
+      // Unconditionally, 'b' would be eaten on its way into the text and the
+      // word "barge" could not be written in the input line at all.
+      if (ch === 'b' && !this.input) {
+        this.emit('barge')
+        continue
+      }
+      if (ch === '\r' || ch === '\n') {
+        const text = this.input.trim()
+        this.input = ''
+        if (text) this.emit('submit', text)
+        continue
+      }
+      if (ch === '\x7f' || ch === '\b') {
+        this.input = this.input.slice(0, -1)
+        continue
+      }
+      if (ch.charCodeAt(0) < 32) continue
+      this.input += ch
     }
-    if (k === '' || k === '\b') {
-      this.input = this.input.slice(0, -1)
-      this.dirty = true
-      return
-    }
-    // ignore control/escape sequences, accept printable text
-    if (k.charCodeAt(0) < 32 || k.startsWith('\x1b')) return
-    this.input += k
     this.dirty = true
   }
 

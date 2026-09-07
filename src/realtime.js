@@ -121,6 +121,10 @@ export class RealtimeSession extends EventEmitter {
     }, 1000).unref?.()
     this.responseActive = false
     this.pendingResponse = false
+    // A new session answers nothing yet, so no turn is being responded to and
+    // no interruption is outstanding.
+    this.respondingTo = undefined
+    this.interruptedForResponse = false
     this.assistantBuffer = ''
     this._partials?.clear()
     this.ready = false
@@ -222,6 +226,26 @@ export class RealtimeSession extends EventEmitter {
         }
         break
 
+      case 'input_audio_buffer.committed':
+        this.currentUserItemId = ev.item_id ?? ev.item?.id ?? this.currentUserItemId
+        // A commit for anything other than the turn being answered is the
+        // server reporting that it segmented a real utterance out of what the
+        // microphone sent: somebody talked over the agent and stopped. That is
+        // the confirmation barge-in waits for — speech recognition is a far
+        // better judge of "was that a voice" than a level is, and a keyboard
+        // never becomes a turn.
+        //
+        // Deliberately not conditional on a response being active. The model
+        // streams an answer far faster than it can be spoken, so it is finished
+        // generating long before anyone hears the end of it, and for most of
+        // that time there is nothing left to cancel — only playback to stop.
+        if (!this.interruptedForResponse && this.currentUserItemId !== this.respondingTo) {
+          this.interruptedForResponse = true
+          if (this.responseActive) this._send({ type: 'response.cancel' })
+          this.emit('interrupt')
+        }
+        break
+
       case 'input_audio_buffer.speech_started':
         this.emit('speech', { active: true })
         break
@@ -280,6 +304,13 @@ export class RealtimeSession extends EventEmitter {
 
       case 'response.created':
         this.responseActive = true
+        this.interruptedForResponse = false
+        // The turn THIS response is answering. Anything committed later is
+        // somebody talking over it. Comparing against the most recent commit
+        // instead is silently fatal: when the user interrupts, their speech is
+        // committed too, so the words meant to confirm the interruption look
+        // like the turn already being answered and are discarded.
+        this.respondingTo = this.currentUserItemId
         break
 
       case 'response.done': {
@@ -298,6 +329,12 @@ export class RealtimeSession extends EventEmitter {
         this._releaseResponse()
         break
     }
+  }
+
+  /** Stop the in-flight response, if there is one, and free the turn. */
+  cancelResponse() {
+    if (this.responseActive) this._send({ type: 'response.cancel' })
+    this._releaseResponse()
   }
 
   close() {

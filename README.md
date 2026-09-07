@@ -183,3 +183,41 @@ sudo apt install ffmpeg pipewire-audio
   selection; `PULSE_SOURCE` env var selects a specific source.
 - **Playback**: `pacat` streams raw PCM directly into PipeWire with minimal
   buffering (~120 ms), keeping latency low and playback in order.
+
+## Barge-in
+
+Talking over the agent stops it. On speakers that is harder than it sounds,
+because the microphone hears the agent too, and how loud it hears it is decided
+by the volume knob — so no fixed level can tell the two apart.
+
+Instead the audio being played is kept as a reference and the microphone is
+judged against the *predicted echo* of it: the coupling between speakers and
+microphone is measured continuously as a ratio, so turning the speakers up
+raises both sides of the comparison and the decision does not move. Your voice
+is found in the gaps between the agent's words, where that prediction drops to
+the room's noise floor however loud the speakers are.
+
+It happens in two stages, because the two mistakes cost very different amounts:
+
+- **Ducking.** When the microphone might be hearing a voice, the agent drops
+  16 dB and holds it while that continues. Being wrong costs a third of a second
+  of quiet that reverses itself, so it can afford to be sensitive — a detector
+  that had to be *sure* would need a threshold near the top of a normal speaking
+  voice. The duck is also what you perceive as the interruption, and it takes
+  most of the agent's own voice out of the microphone so the server can hear you.
+- **Stopping.** The server decides, by segmenting a real turn out of what it
+  heard. A door slam or a keyboard never becomes one, so the volume simply comes
+  back up.
+
+Stopping means stopping the *playback*. The model streams an answer far faster
+than it can be spoken, so it is finished generating long before you hear the end
+of it, and for most of that time cancelling the response would achieve nothing.
+
+Press `b` to interrupt without speaking, or `esc` to stop the audio dead.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HERDR_VOICE_BARGE_LEVEL` | `0.01` | Noise floor: a microphone level below this is never speech. `0` disables client-side barge-in entirely. |
+| `HERDR_VOICE_BARGE_MS` | `300` | How much evidence is needed before ducking. Raise it if the volume dips more often than you like. |
+| `HERDR_VOICE_FULL_DUPLEX` | unset | `1` leaves the microphone open while the agent speaks — correct when the system already cancels echo, or on headphones. |
+| `HERDR_VOICE_ECHO_TRACE` | unset | Record a session for offline replay (see `docs/voice-testing.md`). |
