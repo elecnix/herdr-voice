@@ -1,6 +1,10 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import cp from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execP = promisify(cp.exec)
 
 const HOME = os.homedir()
 const REPO_ROOTS = [path.join(HOME, 'repos'), path.join(HOME, 'repos/personal')]
@@ -13,6 +17,24 @@ export const AGENT_KINDS = [
 ]
 
 const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function tailText(s, n = 2000) {
+  s = String(s ?? '').trim()
+  return s.length > n ? '…' + s.slice(-n) : s
+}
+
+async function readAgentScreen(herdr, target, lines = 50) {
+  const res = await herdr.request('agent.read', {
+    target,
+    source: 'visible',
+    format: 'text',
+    strip_ansi: true,
+    lines,
+  })
+  return (res.read?.text ?? res.text ?? res.content ?? '').toString()
+}
 
 /** Fuzzy-resolve a spoken name to a workspace. Accepts label, number, or id. */
 function resolveWorkspace(snapshot, spoken) {
@@ -251,7 +273,8 @@ export const TOOL_SPECS = [
   },
   {
     name: 'prompt_agent',
-    description: 'Send a prompt/instruction to a running agent and submit it.',
+    description:
+      'Send a prompt/instruction to a running agent, wait for its turn to finish (up to ~25s), and return its reply.',
     parameters: {
       type: 'object',
       properties: {
@@ -277,13 +300,27 @@ export const TOOL_SPECS = [
     },
   },
   {
-    name: 'run_command',
-    description: 'Type and run a shell command in a pane. Use for build/test/git commands.',
+    name: 'run_in_pane',
+    description:
+      'Type a shell command into a pane and submit it. Does not wait for output and does not return it — the command runs in the pane where you can see it. Use for interactive tasks.',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: 'The shell command' },
         space: { type: 'string', description: 'Space whose pane to run in. Omit for current.' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'run_shell',
+    description:
+      'Run a shell command directly on this machine and wait for it to finish. Returns stdout, stderr, and exit code — always use the real output in your answer. Use for build/test/git, reading files, checking status.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The shell command' },
       },
       required: ['command'],
       additionalProperties: false,
@@ -358,6 +395,19 @@ export const TOOL_SPECS = [
 export const REALTIME_TOOLS = TOOL_SPECS.map((t) => ({ type: 'function', ...t }))
 
 /** Compact state summary used both for grounding the model and for the TUI. */
+/**
+ * How to address an agent when talking to herdr.
+ *
+ * The pane id is what the server resolves. The name is ours — synthesised from
+ * the terminal title so a person can say it — and herdr 0.8 stopped returning a
+ * `name` field at all, so addressing agents by it started failing with
+ * agent_not_found on every call while they still listed and displayed normally.
+ * The name is kept for matching what the user said, and never sent.
+ */
+function agentTarget(a) {
+  return a.pane_id ?? a.name
+}
+
 export async function readState(herdr) {
   const [snapRes, agentsRes] = await Promise.all([
     herdr.request('session.snapshot'),
@@ -551,9 +601,35 @@ export function createExecutor(herdr, { onNotice } = {}) {
         if (!a) {
           return { ok: false, error: agents.length ? `No agent matching "${args.agent}".` : 'No agents are running.' }
         }
-        await herdr.request('agent.prompt', { target: a.name ?? a.pane_id, text: args.text })
+        const target = agentTarget(a)
+        const before = await readAgentScreen(herdr, target).catch(() => '')
+        await herdr.request('agent.prompt', { target, text: args.text })
         notice(`prompted ${a.name}`)
-        return { ok: true, agent: a.name, sent: args.text }
+        // Capture the agent's turn in THIS tool result: wait until the agent
+        // leaves idle (starts working) and comes back, so the model can speak
+        // the reply instead of blindly claiming it was sent.
+        const t0 = Date.now()
+        let sawWorking = false
+        let reply = ''
+        while (Date.now() - t0 < 25_000) {
+          await sleep(700)
+          const [status, screen] = await Promise.all([
+            readState(herdr)
+              .then((s) => s.agents.find((x) => agentTarget(x) === target)?.status)
+              .catch(() => undefined),
+            readAgentScreen(herdr, target).catch(() => ''),
+          ])
+          if (status && status !== 'idle') sawWorking = true
+          reply = screen
+          if (sawWorking && status === 'idle') break
+          if (!sawWorking && Date.now() - t0 > 8000 && reply && reply !== before) break
+        }
+        return {
+          ok: true,
+          agent: a.name,
+          turn: sawWorking ? 'completed' : 'no activity detected',
+          reply: tailText(reply),
+        }
       }
 
       case 'read_agent': {
@@ -562,7 +638,7 @@ export function createExecutor(herdr, { onNotice } = {}) {
         // `visible` = what is on screen now. `recent` only returns output since the
         // last read, so it comes back empty on a first read — wrong for "what is it doing?".
         const res = await herdr.request('agent.read', {
-          target: a.name ?? a.pane_id,
+          target: agentTarget(a),
           source: 'visible',
           format: 'text',
           strip_ansi: true,
@@ -573,7 +649,7 @@ export function createExecutor(herdr, { onNotice } = {}) {
         return { ok: true, agent: a.name, status: a.status, output: text.slice(-2500) }
       }
 
-      case 'run_command': {
+      case 'run_in_pane': {
         let paneId = snapshot.focused_pane_id
         if (args.space) {
           const w = needSpace(args.space)
@@ -583,6 +659,56 @@ export function createExecutor(herdr, { onNotice } = {}) {
         await herdr.request('pane.send_text', { pane_id: paneId, text: args.command + '\n' })
         notice(`ran: ${args.command}`)
         return { ok: true, ran: args.command, pane_id: paneId }
+      }
+
+      case 'run_shell': {
+        // Execute directly on this machine instead of typing into a pane.
+        // The pane-based version was fire-and-forget: it sent keystrokes and
+        // returned only an echo of the command, so the model never saw any
+        // output (and if the resolved pane hosted an agent, the "command"
+        // was delivered to the agent as a chat prompt). Direct execution
+        // makes the result self-contained: real stdout/stderr/exit code.
+        const t0 = Date.now()
+        const cwd =
+          snapshot.panes?.find((p) => p.pane_id === snapshot.focused_pane_id)?.foreground_cwd ??
+          process.env.HOME
+        try {
+          const { stdout, stderr } = await execP(String(args.command), {
+            cwd,
+            timeout: 60_000,
+            maxBuffer: 4 * 1024 * 1024,
+            encoding: 'utf8',
+          })
+          notice(`ran: ${args.command}`)
+          return {
+            ok: true,
+            ran: args.command,
+            exit_code: 0,
+            cwd,
+            stdout: tailText(stdout, 4000),
+            stderr: tailText(stderr, 1500),
+            duration_ms: Date.now() - t0,
+          }
+        } catch (e) {
+          // exec rejects on non-zero exit (with captured output in e) and on
+          // timeout (e.killed). Either way the captured output is the payload.
+          //
+          // `ok` follows the COMMAND, not the tool call. Reporting a failed
+          // build as ok:true because the tool itself worked is how the model
+          // ends up telling the user the tests passed: it reads the flag before
+          // it reads the exit code.
+          notice(`ran ${args.command} (exit ${e.code ?? 'timeout'})`)
+          return {
+            ok: false,
+            ran: args.command,
+            exit_code: typeof e.code === 'number' ? e.code : undefined,
+            timed_out: !!e.killed,
+            cwd,
+            stdout: tailText(e.stdout, 4000),
+            stderr: tailText(e.stderr ?? e.message, 1500),
+            duration_ms: Date.now() - t0,
+          }
+        }
       }
 
       case 'notify':
@@ -597,7 +723,7 @@ export function createExecutor(herdr, { onNotice } = {}) {
         if (!a) {
           return { ok: false, error: agents.length ? `No agent matching "${args.agent}".` : 'No agents are running.' }
         }
-        await herdr.request('agent.focus', { target: a.name ?? a.pane_id })
+        await herdr.request('agent.focus', { target: agentTarget(a) })
         return { ok: true, focused: a.name, status: a.status }
       }
 
@@ -682,4 +808,7 @@ Rules:
 - If you are unsure which space or agent the user means, call get_state and match it yourself rather than asking, unless it is genuinely ambiguous between two similar names.
 - Vocabulary: "space" = workspace, "pane" = a terminal split, "agent" = a coding agent like claude or codex.
 - When the user asks what is running or what an agent is doing, use get_state and read_agent, then summarize in one or two sentences.
+- run_shell executes directly on this machine and returns real stdout/stderr/exit code. Read it and use the actual numbers/text in your answer — never say you cannot see command output. For destructive or irreversible shell commands (rm -rf, git push, force resets), confirm with the user out loud first.
+- prompt_agent returns the agent's reply once its turn finishes. Use read_agent afterwards for a live view.
+- When the user asks a question or requests content (explanations, poems, summaries), answer it fully using real tool output — terseness is for confirming actions, not for answers.
 - Never invent space names, agent names, or statuses. Read them with get_state first.`
