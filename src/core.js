@@ -116,10 +116,13 @@ export async function startCore({ herdr, ui, apiKey, mode = 'voice', wantMic = t
           : 'no microphone available — grant mic permission (System Settings > Privacy & Security > Microphone). Text input still works.'
       )
     } else {
-      const device = micDevice ?? `:${picked.index}`
+      // On Linux, select the configured source explicitly (from PULSE_SOURCE)
+      // rather than passing "default", so the service doesn't fall back to an
+      // uncalibrated device. On macOS, use the picked device's index.
+      const device = micDevice ?? (process.platform === 'darwin' ? `:${picked.index}` : (process.env.PULSE_SOURCE ?? 'default'))
       mic = new MicCapture({ device }).start()
       ui.setMic({ available: true, muted: true })
-      ui.addSystem(`mic: ${micDevice ?? picked.name} — unmute to talk`)
+      ui.addSystem(`mic: ${micDevice ?? MicCapture.describe(device, devices)} — unmute to talk`)
       mic.on('chunk', (b64) => session.sendAudio(b64))
       mic.on('level', (l) => ui.setMic({ level: l }))
       mic.on('error', (e) => {

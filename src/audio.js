@@ -1,6 +1,8 @@
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { SAMPLE_RATE } from './config.js'
+
+const DEVICE_LIST_TIMEOUT_MS = 2000
 
 /**
  * Parse the audio devices out of `ffmpeg -f avfoundation -list_devices true`.
@@ -20,11 +22,34 @@ export function parseAvfoundationDevices(stderr) {
   return devices
 }
 
+/**
+ * Parse the audio sources out of `pactl list sources`.
+ * Monitors (loopback sources) are filtered out because they capture the output
+ * sink, not the microphone, giving silence (or wrong input).
+ */
+export function parsePactlSources(pactl) {
+  const audio = []
+  let cur = null
+  for (const line of String(pactl).split('\n')) {
+    const name = line.match(/^\s*Name:\s*(\S+)/)
+    const desc = line.match(/^\s*Description:\s*(.+?)\s*$/)
+    if (name) {
+      cur = { index: name[1], name: name[1] }
+    } else if (desc && cur) {
+      cur.name = desc[1]
+      if (!cur.index.endsWith('.monitor')) audio.push(cur)
+      cur = null
+    }
+  }
+  return audio
+}
+
 /** ffmpeg arguments for capturing a microphone as PCM16 mono. */
-export function captureArgs({ device, sampleRate = SAMPLE_RATE }) {
+export function captureArgs({ device, sampleRate = SAMPLE_RATE, platform = process.platform }) {
+  const isDarwin = platform === 'darwin'
   return [
     '-hide_banner', '-loglevel', 'error',
-    '-f', 'avfoundation',
+    '-f', isDarwin ? 'avfoundation' : 'pulse',
     '-i', device,
     '-ar', String(sampleRate),
     '-ac', '1',
@@ -34,20 +59,35 @@ export function captureArgs({ device, sampleRate = SAMPLE_RATE }) {
 }
 
 /**
- * ffplay arguments for playing raw PCM16 mono from a pipe.
+ * Player arguments for raw PCM16 mono playback.
  *
- * ffplay REJECTS `-ac`, which silently killed audio output for days — every
- * play exited 1, unseen. The channel count has to be `-ch_layout mono`. The
- * test for this exists to stop that coming back.
+ * macOS: ffplay with `-ch_layout mono` instead of `-ac` (ffplay rejects `-ac`
+ * and exits 1 silently).
+ * Linux: pacat streams directly into PipeWire with minimal buffering.
  */
-export function playerArgs({ sampleRate = SAMPLE_RATE } = {}) {
-  return [
-    '-hide_banner', '-loglevel', 'error',
-    '-nodisp', '-autoexit',
-    '-fflags', 'nobuffer', '-flags', 'low_delay',
-    '-f', 's16le', '-ar', String(sampleRate), '-ch_layout', 'mono',
-    '-i', 'pipe:0',
-  ]
+export function playerArgs({ sampleRate = SAMPLE_RATE, platform = process.platform } = {}) {
+  const isDarwin = platform === 'darwin'
+  const cmd = process.env.HERDR_VOICE_PLAYER_CMD ?? (isDarwin ? 'ffplay' : 'pacat')
+  if (cmd === 'ffplay') {
+    return [
+      '-hide_banner', '-loglevel', 'error',
+      '-nodisp', '-autoexit',
+      '-fflags', 'nobuffer', '-flags', 'low_delay',
+      '-f', 's16le', '-ar', String(sampleRate), '-ch_layout', 'mono',
+      '-i', 'pipe:0',
+    ]
+  }
+  if (cmd === 'pacat') {
+    return [
+      '--raw',
+      '--format=s16le',
+      `--rate=${sampleRate}`,
+      '--channels=1',
+      '--latency-msec=120',
+      '--client-name=herdr-voice',
+    ]
+  }
+  return []
 }
 
 /**
@@ -69,12 +109,63 @@ export class MicCapture extends EventEmitter {
 
   static async listDevices() {
     return new Promise((resolve) => {
+      // Bound by timeout: a wedged sound server never closes the pipe, and this
+      // is awaited during startup. The hung process is killed so it doesn't hold
+      // the event loop open.
+      let child = null
+      const bail = setTimeout(() => {
+        child?.kill()
+        resolve([])
+      }, DEVICE_LIST_TIMEOUT_MS)
+      const done = (list) => {
+        clearTimeout(bail)
+        resolve(list)
+      }
+
+      if (process.platform !== 'darwin') {
+        // Linux: PulseAudio/PipeWire sources via pactl.
+        const p = spawn('pactl', ['list', 'sources'], {
+          env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+        })
+        child = p
+        let buf = ''
+        p.stdout.on('data', (d) => (buf += d.toString()))
+        p.on('close', () => done(parsePactlSources(buf)))
+        p.on('error', () => done([]))
+        return
+      }
+
+      // macOS: ffmpeg AVFoundation.
       const p = spawn('ffmpeg', ['-f', 'avfoundation', '-list_devices', 'true', '-i', ''])
+      child = p
       let buf = ''
       p.stderr.on('data', (d) => (buf += d.toString()))
-      p.on('close', () => resolve(parseAvfoundationDevices(buf)))
-      p.on('error', () => resolve([]))
+      p.on('close', () => done(parseAvfoundationDevices(buf)))
+      p.on('error', () => done([]))
     })
+  }
+
+  /**
+   * Human-readable name for the source actually being captured. "default"
+   * is resolved through the sound server on Linux so the UI says which device
+   * that turned out to be rather than repeating the word back.
+   */
+  static describe(device, devices = []) {
+    let name = device
+    if (device === 'default' && process.platform !== 'darwin') {
+      try {
+        const out = execFileSync('pactl', ['info'], {
+          encoding: 'utf8',
+          timeout: DEVICE_LIST_TIMEOUT_MS,
+          env: { ...process.env, LANG: 'C', LC_ALL: 'C' },
+        })
+        name = out.match(/^Default Source:\s*(\S+)/m)?.[1] ?? device
+      } catch {
+        /* no pactl or timeout: the raw name is the best we have */
+      }
+    }
+    const known = devices.find((d) => d.index === name)
+    return known && known.name !== name ? `${known.name} (${name})` : name
   }
 
   /**
@@ -92,7 +183,10 @@ export class MicCapture extends EventEmitter {
   }
 
   start() {
-    const proc = spawn('ffmpeg', captureArgs({ device: this.device }))
+    const isDarwin = process.platform === 'darwin'
+    // On Linux, a legacy avfoundation-style index (":0") means "just use default".
+    const input = !isDarwin && /^:\d+$/.test(this.device) ? 'default' : this.device
+    const proc = spawn('ffmpeg', captureArgs({ device: input, platform: process.platform }))
     this.proc = proc
 
     // bytes per chunk: 2 bytes/sample * rate * ms/1000
@@ -146,18 +240,21 @@ export class AudioPlayer extends EventEmitter {
   }
 
   _spawn() {
-    const proc = spawn('ffplay', playerArgs())
+    const isDarwin = process.platform === 'darwin'
+    const cmd = process.env.HERDR_VOICE_PLAYER_CMD ?? (isDarwin ? 'ffplay' : 'pacat')
+    const args = playerArgs({ platform: process.platform })
+    const proc = spawn(cmd, args)
     let err = ''
     proc.stderr.on('data', (d) => (err += d.toString()))
     proc.on('error', (e) => {
       this.failed = true
-      this.emit('error', new Error(`ffplay unavailable: ${e.message}`))
+      this.emit('error', new Error(`${cmd} unavailable: ${e.message}`))
     })
     proc.on('close', (code) => {
       if (this.proc === proc) this.proc = null
       if (code !== 0 && code !== null && !this.failed) {
         this.failed = true
-        this.emit('error', new Error(`ffplay exited ${code}: ${err.slice(0, 160)}`))
+        this.emit('error', new Error(`${cmd} exited ${code}: ${err.slice(0, 160)}`))
       }
     })
     proc.stdin.on('error', () => {})

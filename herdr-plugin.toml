@@ -3,7 +3,7 @@ name = "Voice"
 version = "0.2.0"
 min_herdr_version = "0.7.0"
 description = "Voice control for herdr via the OpenAI Realtime API — speak to create spaces, split panes, apply layouts, and start/prompt agents. Compact HUD with live dictation, clickable toggles, and persisted transcripts."
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 # Install the single runtime dependency (ws). Runs once at plugin install,
 # after the user confirms the trust preview.
@@ -28,7 +28,9 @@ command = ["node", "src/ui.js"]
 id = "dock"
 title = "voice"
 placement = "split"
-command = ["node", "src/ui.js"]
+# macOS: HUD renderer attached to the engine started by the summon flow.
+# Linux: no summon daemon — run the all-in-one engine + full TUI in the pane.
+command = ["sh", "-c", "if [ \"$(uname)\" = Darwin ]; then exec node src/ui.js; else [ -f \"$HERDR_PLUGIN_CONFIG_DIR/env\" ] && . \"$HERDR_PLUGIN_CONFIG_DIR/env\"; exec node src/index.js --full; fi"]
 
 # All-in-one popup (engine + UI in one process on this host). Modal while open;
 # useful on a single machine with a real microphone, or for text-only control.
