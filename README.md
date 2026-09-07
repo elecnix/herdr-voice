@@ -167,3 +167,19 @@ Check what's visible with:
 ```bash
 ffmpeg -f avfoundation -list_devices true -i "" 2>&1 | grep -A5 "audio devices"
 ```
+
+### Linux
+
+Requires `ffmpeg` (mic capture and fallback playback) and `pipewire-audio` (playback server):
+
+```bash
+# Debian/Ubuntu
+sudo apt install ffmpeg pipewire-audio
+```
+
+- **Microphone**: sources are enumerated with `pactl list sources`. Monitors
+  (loopback sources capturing outputs) are filtered out. Capture runs through
+  `ffmpeg -f pulse`. The device name `default` follows the desktop's own input
+  selection; `PULSE_SOURCE` env var selects a specific source.
+- **Playback**: `pacat` streams raw PCM directly into PipeWire with minimal
+  buffering (~120 ms), keeping latency low and playback in order.
