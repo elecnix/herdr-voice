@@ -4,6 +4,13 @@ import { SAMPLE_RATE } from './config.js'
 
 const DEVICE_LIST_TIMEOUT_MS = 2000
 
+// How far ahead of realtime the player is fed: small enough that a change to
+// what is queued reaches the speaker promptly, large enough to absorb
+// scheduling jitter without leaving a gap.
+const LEAD_MS = 150
+const PUMP_MS = 25
+const PUMP_CHUNK_MS = 50
+
 /**
  * Parse the audio devices out of `ffmpeg -f avfoundation -list_devices true`.
  * Split out from the capture class so it can be tested against recorded output:
@@ -237,6 +244,31 @@ export class AudioPlayer extends EventEmitter {
     super()
     this.proc = null
     this.failed = false
+    this.gain = 1
+    // Audio not yet handed to the player, and the wall-clock time at which the
+    // next sample handed over will be HEARD.
+    this.pending = Buffer.alloc(0)
+    this.playHead = 0
+    this.timer = null
+  }
+
+  /**
+   * Playback volume, applied to samples on their way out rather than to the
+   * queue behind them — so it takes effect on audio that has not been handed
+   * over yet, which is the point.
+   */
+  setGain(gain) {
+    this.gain = gain
+  }
+
+  /** Apply the gain to PCM16. Returns the buffer itself at unity. */
+  scale(pcm) {
+    if (this.gain === 1) return pcm
+    const out = Buffer.alloc(pcm.length)
+    for (let i = 0; i < pcm.length / 2; i++) {
+      out.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(pcm.readInt16LE(i * 2) * this.gain))), i * 2)
+    }
+    return out
   }
 
   _spawn() {
@@ -266,15 +298,71 @@ export class AudioPlayer extends EventEmitter {
     return this
   }
 
+  /**
+   * Queue audio for playback, handed to the player a little at a time rather
+   * than all at once.
+   *
+   * The model streams an answer far faster than it can be spoken — a minute of
+   * speech can arrive in a few seconds. Written straight through, all of it sits
+   * in a pipe the app no longer controls: it cannot be quietened, it cannot be
+   * dropped without killing the player, and there is no way to know which part
+   * of it the room is hearing at any moment. Feeding the player just ahead of
+   * realtime keeps all three.
+   */
   play(base64) {
-    if (!this.proc?.stdin.writable) {
-      if (this.failed) return
-      this.proc = this._spawn() // respawn after a clean autoexit
+    if (this.failed) return
+    const buf = Buffer.from(base64, 'base64')
+    this.pending = this.pending.length ? Buffer.concat([this.pending, buf]) : buf
+    this._pump()
+    if (!this.timer) {
+      this.timer = setInterval(() => this._pump(), PUMP_MS)
+      this.timer.unref?.()
     }
-    this.proc.stdin.write(Buffer.from(base64, 'base64'))
+  }
+
+  /** Hand over whatever is due, at the gain in force at this moment. */
+  _pump() {
+    const now = Date.now()
+    if (this.playHead < now) this.playHead = now // the queue ran dry; start now
+    const bytesPerMs = (SAMPLE_RATE * 2) / 1000
+    while (this.pending.length && this.playHead - now < LEAD_MS) {
+      const n = Math.min(this.pending.length, Math.floor(bytesPerMs * PUMP_CHUNK_MS))
+      const chunk = this.scale(this.pending.subarray(0, n))
+      this.pending = this.pending.subarray(n)
+      if (!this.proc?.stdin.writable) {
+        if (this.failed) return
+        this.proc = this._spawn() // respawn after a clean autoexit
+      }
+      this.proc.stdin.write(chunk)
+      // Says exactly when this audio reaches the room, for anything that needs
+      // to know what the microphone is about to hear.
+      this.emit('played', { pcm: chunk, at: this.playHead })
+      this.playHead += n / bytesPerMs
+    }
+    if (!this.pending.length && this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
+  }
+
+  /** Drop everything queued, played and unplayed. */
+  flush() {
+    clearInterval(this.timer)
+    this.timer = null
+    this.pending = Buffer.alloc(0)
+    this.playHead = 0
+    try {
+      this.proc?.kill('SIGKILL')
+    } catch {
+      /* already gone */
+    }
+    this.proc = null
   }
 
   stop() {
+    clearInterval(this.timer)
+    this.timer = null
+    this.pending = Buffer.alloc(0)
     try {
       this.proc?.stdin.end()
       this.proc?.kill('SIGTERM')
