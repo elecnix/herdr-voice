@@ -274,7 +274,7 @@ export const TOOL_SPECS = [
   {
     name: 'prompt_agent',
     description:
-      "Send a prompt/instruction to a running agent and wait for its turn (up to ~25s). turn is 'completed' (reply ready), 'still_running' (deadline hit while working — partial screen in reply, check back with read_agent), or 'no activity detected'.",
+      "Send a prompt/instruction to a running agent and wait for its turn (up to ~25s). turn is 'completed' (reply ready), 'blocked' (the agent is waiting for a person to answer an approval prompt, which is in reply), 'still_running' (deadline hit while working, partial screen in reply, check back with read_agent), or 'no activity detected'.",
     parameters: {
       type: 'object',
       properties: {
@@ -407,6 +407,21 @@ export const REALTIME_TOOLS = TOOL_SPECS.map((t) => ({ type: 'function', ...t })
 function agentTarget(a) {
   return a.pane_id ?? a.name
 }
+
+/**
+ * The agent states herdr reports. `herdr agent wait --until` names all five:
+ * idle, working, blocked, done, unknown.
+ *
+ * `done` is an idle agent whose pane nobody has looked at since it finished, so
+ * it ends a turn exactly as `idle` does. Treating it as anything else reports
+ * finished work as still running. `blocked` is an agent waiting on a person:
+ * activity, but never an answer, and it will not resolve without them. And
+ * `unknown` is the absence of a reading rather than a state, so it is evidence
+ * of nothing: counting it as work turns an agent that never stirred into one
+ * that is "still running past the deadline".
+ */
+const AGENT_SETTLED = new Set(['idle', 'done'])
+const AGENT_ACTIVE = new Set(['working', 'blocked'])
 
 export async function readState(herdr) {
   const [snapRes, agentsRes] = await Promise.all([
@@ -618,6 +633,7 @@ export function createExecutor(herdr, { onNotice, promptTimeoutMs, shellTimeoutM
         const t0 = Date.now()
         let sawWorking = false
         let completed = false
+        let blocked = false
         let reply = ''
         while (Date.now() - t0 < PROMPT_DEADLINE_MS) {
           await sleep(700)
@@ -627,13 +643,31 @@ export function createExecutor(herdr, { onNotice, promptTimeoutMs, shellTimeoutM
               .catch(() => undefined),
             readAgentScreen(herdr, target).catch(() => ''),
           ])
-          if (status && status !== 'idle') sawWorking = true
+          if (AGENT_ACTIVE.has(status)) sawWorking = true
           reply = screen
-          if (sawWorking && status === 'idle') {
+          // An agent waiting on a person will not move again on its own, so
+          // there is nothing left to wait for. Say what it is waiting on.
+          if (status === 'blocked') {
+            blocked = true
+            break
+          }
+          if (sawWorking && AGENT_SETTLED.has(status)) {
             completed = true
             break
           }
           if (!sawWorking && Date.now() - t0 > 8000 && reply && reply !== before) break
+        }
+        if (blocked) {
+          notice(`${a.name} is waiting for approval`)
+          return {
+            ok: true,
+            agent: a.name,
+            turn: 'blocked',
+            needs_approval: true,
+            waited_ms: Date.now() - t0,
+            // The approval prompt itself: what the user has to answer.
+            reply: tailText(reply),
+          }
         }
         if (completed) {
           return {
@@ -882,6 +916,7 @@ Rules:
 - Vocabulary: "space" = workspace, "pane" = a terminal split, "agent" = a coding agent like claude or codex.
 - When the user asks what is running or what an agent is doing, use get_state and read_agent, then summarize in one or two sentences.
 - run_shell executes directly on this machine and returns real stdout/stderr/exit code. Read it and use the actual numbers/text in your answer — never say you cannot see command output. For destructive or irreversible shell commands (rm -rf, git push, force resets), confirm with the user out loud first.
-- prompt_agent returns the agent's reply once its turn finishes. If turn is "still_running", the agent is mid-work: never present reply as final, say it is still running, and use read_agent to check on it later.
+- prompt_agent returns the agent's reply once its turn finishes. If turn is "still_running", the agent is mid-work: never present reply as final, say it is still running, and use read_agent to check on it later. If turn is "blocked", the agent is waiting for the user to answer an approval prompt in its pane. Tell them what it is asking and that it needs their answer, not that it is still working.
+- Agent statuses come from herdr and mean: idle (waiting for you), working (mid-turn), blocked (waiting for a person), done (finished, pane unread since), unknown (no reading, so say you cannot tell rather than guess).
 - When the user asks a question or requests content (explanations, poems, summaries), answer it fully using real tool output — terseness is for confirming actions, not for answers.
 - Never invent space names, agent names, or statuses. Read them with get_state first.`

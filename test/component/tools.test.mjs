@@ -127,6 +127,88 @@ const check = (name, ok, detail) => {
   check('the prompt itself was still delivered', herdr.sent('agent.prompt')[0]?.text === 'do the big refactor')
 }
 
+// ---- the agent statuses herdr actually emits ----
+// `herdr agent wait --until` names all five: idle, working, blocked, done,
+// unknown. Recognising only `idle` as the end of a turn leaves three of them
+// misread. The fixtures below are producer-shaped: `agent_status`, and no
+// `name` field, which is what herdr 0.8 puts on the wire.
+{
+  // `done` is an agent that finished while nobody was looking at its pane. It
+  // settles a turn exactly as `idle` does, so reporting it as still running
+  // sends the user back to check on work that is already finished.
+  let polls = 0
+  const herdr = fakeHerdr({
+    agents: [{ pane_id: 'p1', agent: 'claude', terminal_title_stripped: 'builder', agent_status: 'idle' }],
+    screens: { p1: () => (polls > 2 ? 'build finished, 0 errors' : 'compiling') },
+  })
+  const realRequest = herdr.request.bind(herdr)
+  herdr.request = async (method, params) => {
+    if (method === 'agent.list') {
+      polls++
+      herdr.state.agents[0].agent_status = polls <= 1 ? 'idle' : polls <= 3 ? 'working' : 'done'
+    }
+    return realRequest(method, params)
+  }
+  const run = createExecutor(herdr, { onNotice: () => {}, promptTimeoutMs: 6000 })
+  const res = await run('prompt_agent', { agent: 'builder', text: 'build it' })
+  check('an agent that settles into `done` has completed its turn', res.turn === 'completed', JSON.stringify({ turn: res.turn, timed_out: res.timed_out }))
+  check('a `done` turn is not reported as a deadline hit', res.timed_out !== true, JSON.stringify(res.timed_out))
+  check('the reply is read back from a `done` agent', String(res.reply).includes('build finished'), JSON.stringify(res.reply))
+}
+{
+  // `blocked` is an agent waiting on a person: an approval prompt sitting in
+  // the pane. It is activity, but it is not an answer, and no further waiting
+  // will turn it into one. Calling it "still working" hides the one thing the
+  // user has to do to get their answer.
+  let polls = 0
+  const herdr = fakeHerdr({
+    agents: [{ pane_id: 'p1', agent: 'claude', terminal_title_stripped: 'deployer', agent_status: 'idle' }],
+    screens: { p1: () => (polls > 1 ? 'Bash command: rm -rf build/  1. Yes  2. No' : 'thinking') },
+  })
+  const realRequest = herdr.request.bind(herdr)
+  herdr.request = async (method, params) => {
+    if (method === 'agent.list') {
+      polls++
+      herdr.state.agents[0].agent_status = polls <= 1 ? 'idle' : polls <= 2 ? 'working' : 'blocked'
+    }
+    return realRequest(method, params)
+  }
+  const run = createExecutor(herdr, { onNotice: () => {}, promptTimeoutMs: 6000 })
+  const started = Date.now()
+  const res = await run('prompt_agent', { agent: 'deployer', text: 'deploy it' })
+  const took = Date.now() - started
+  check('an agent waiting for approval is reported as blocked', res.turn === 'blocked', res.turn)
+  check('a blocked agent has not completed its turn', res.turn !== 'completed', res.turn)
+  check('a blocked agent is not reported as a deadline hit', res.timed_out !== true, JSON.stringify(res.timed_out))
+  check('blocked comes back when it is seen, not at the end of the deadline', took < 5000, `returned after ${took}ms`)
+  check('the approval prompt comes back, so the user can be told what to approve', String(res.reply).includes('rm -rf build/'), JSON.stringify(res.reply))
+}
+{
+  // `unknown` is the absence of a reading, not a busy agent. Counting it as
+  // work turns an agent that never stirred into one "still running past the
+  // deadline", the same false progress report in a new costume.
+  const herdr = fakeHerdr({
+    agents: [{ pane_id: 'p1', agent: 'claude', terminal_title_stripped: 'ghost', agent_status: 'unknown' }],
+    screens: { p1: 'nothing here' },
+  })
+  const run = createExecutor(herdr, { onNotice: () => {}, promptTimeoutMs: 2500 })
+  const res = await run('prompt_agent', { agent: 'ghost', text: 'hello' })
+  check('an unknown status is not evidence of work', res.turn !== 'still_running', res.turn)
+  check('an unknown status is not a completed turn either', res.turn !== 'completed', res.turn)
+}
+{
+  // An agent that was already `done` before the prompt arrived has not
+  // answered it, and has not started working on it either.
+  const herdr = fakeHerdr({
+    agents: [{ pane_id: 'p1', agent: 'claude', terminal_title_stripped: 'napper', agent_status: 'done' }],
+    screens: { p1: 'finished something else an hour ago' },
+  })
+  const run = createExecutor(herdr, { onNotice: () => {}, promptTimeoutMs: 2500 })
+  const res = await run('prompt_agent', { agent: 'napper', text: 'hello' })
+  check('an agent already done before the prompt has not completed a turn', res.turn !== 'completed', res.turn)
+  check('and a pre-existing `done` is not counted as work in progress', res.timed_out !== true, JSON.stringify({ turn: res.turn, timed_out: res.timed_out }))
+}
+
 // ---- run_shell executes on the voice host, and must say so ----
 {
   // A remote/tunnel session: the snapshot's foreground_cwd is a path on the
