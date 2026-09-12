@@ -160,6 +160,23 @@ const check = (name, ok, detail) => {
   check('the refusal still suggests run_in_pane', String(res.error).includes('run_in_pane'), res.error)
 }
 
+{
+  // The remote workspace path exists on the voice host too. Two machines with
+  // the same repo checked out at the same path is the ordinary case, not an
+  // exotic one, so path existence cannot stand in for host identity: only the
+  // declared host can refuse this.
+  const probe = path.join(os.tmpdir(), `herdr-voice-local-twin-probe-${process.pid}`)
+  fs.rmSync(probe, { force: true })
+  const herdr = fakeHerdr({
+    panes: [{ pane_id: 'p1', workspace_id: 'w1', foreground_cwd: process.cwd() }],
+  })
+  const run = createExecutor(herdr, { onNotice: () => {}, remoteHost: 'studio-ts' })
+  const res = await run('run_shell', { command: `touch ${probe}` })
+  check('a remote workspace path that also exists locally is still not run here', res.ok === false && !fs.existsSync(probe), JSON.stringify(res))
+  check('and the refusal names the remote host rather than the path', String(res.error).includes('studio-ts'), res.error)
+  fs.rmSync(probe, { force: true })
+}
+
 // ---- agents are addressed by pane id, not by the name we made up ----
 {
   // herdr 0.8 stopped returning a `name` field. The name shown to the user is
